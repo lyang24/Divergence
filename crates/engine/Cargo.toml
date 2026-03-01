@@ -1,0 +1,13 @@
+[package]
+name = "divergence-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+divergence-core = { workspace = true }
+divergence-storage = { workspace = true }
+divergence-buffer = { workspace = true }
+divergence-index = { workspace = true }
+monoio = { workspace = true }
+core_affinity = { workspace = true }
+crossbeam = { workspace = true }
