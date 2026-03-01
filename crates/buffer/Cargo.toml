@@ -1,0 +1,8 @@
+[package]
+name = "divergence-buffer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+divergence-core = { workspace = true }
+crossbeam = { workspace = true }

@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/storage",
+    "crates/buffer",
+    "crates/index",
+    "crates/engine",
+    "crates/server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Internal crates
+divergence-core = { path = "crates/core" }
+divergence-storage = { path = "crates/storage" }
+divergence-buffer = { path = "crates/buffer" }
+divergence-index = { path = "crates/index" }
+divergence-engine = { path = "crates/engine" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Concurrency
+crossbeam = "0.8"
+
+# Async runtime
+monoio = { version = "0.2", features = ["iouring"] }
+
+# CPU affinity
+core_affinity = "0.8"
+
+# Random
+rand = "0.8"
+rand_xoshiro = "0.6"
+
+# Testing & benchmarks
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# Error handling
+thiserror = "2"

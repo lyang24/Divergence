@@ -1,0 +1,7 @@
+[package]
+name = "divergence-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+divergence-engine = { workspace = true }

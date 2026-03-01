@@ -1,0 +1,9 @@
+[package]
+name = "divergence-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+rand = { workspace = true }
+rand_xoshiro = { workspace = true }
