@@ -6,8 +6,13 @@ edition.workspace = true
 [dependencies]
 divergence-core = { workspace = true }
 divergence-storage = { workspace = true }
-divergence-buffer = { workspace = true }
 divergence-index = { workspace = true }
 monoio = { workspace = true }
+io-uring = { workspace = true }
 core_affinity = { workspace = true }
-crossbeam = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+rand = { workspace = true }
+rand_xoshiro = { workspace = true }

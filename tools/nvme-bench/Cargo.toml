@@ -1,0 +1,17 @@
+[package]
+name = "nvme-bench"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "nvme-bench"
+path = "src/main.rs"
+
+[dependencies]
+monoio = { version = "0.2", features = ["iouring"] }
+io-uring = "0.6"
+core_affinity = "0.8"
+libc = "0.2"
+rand = "0.8"
+rand_xoshiro = "0.6"
+clap = { version = "4", features = ["derive"] }

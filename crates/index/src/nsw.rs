@@ -574,6 +574,23 @@ impl NswIndex {
     pub fn dimension(&self) -> usize {
         self.dimension
     }
+
+    // -- Serialization accessors (used by storage crate) --
+
+    /// Raw flat vector data: N * dimension f32 values.
+    pub fn vectors_raw(&self) -> &[f32] {
+        &self.vectors
+    }
+
+    /// Neighbors of a given vector ID (public version).
+    pub fn neighbors(&self, vid: u32) -> &[u32] {
+        self.slot_layout.get_neighbors(&self.graph_data, vid)
+    }
+
+    /// Max neighbors per node.
+    pub fn max_degree(&self) -> usize {
+        self.config.m_max
+    }
 }
 
 // ---------------------------------------------------------------------------
