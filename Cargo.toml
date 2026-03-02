@@ -7,6 +7,7 @@ members = [
     "crates/index",
     "crates/engine",
     "crates/server",
+    "tools/nvme-bench",
 ]
 
 [workspace.package]
@@ -31,6 +32,7 @@ crossbeam = "0.8"
 
 # Async runtime
 monoio = { version = "0.2", features = ["iouring"] }
+io-uring = "0.6"
 
 # CPU affinity
 core_affinity = "0.8"
@@ -41,6 +43,9 @@ rand_xoshiro = "0.6"
 
 # Testing & benchmarks
 criterion = { version = "0.5", features = ["html_reports"] }
+
+# System
+libc = "0.2"
 
 # Error handling
 thiserror = "2"
