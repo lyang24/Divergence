@@ -3715,3 +3715,248 @@ fn exp_bw_overlap_sweep() {
     eprintln!("B×W sweep complete");
 }
 
+// ---------------------------------------------------------------------------
+// EXP-QD: Multi-core QD sweep — global device queue depth budget
+// ---------------------------------------------------------------------------
+
+/// Sweep cores × global_qd to find the operating point where throughput
+/// is maximized without p99 explosion.
+///
+/// Each core runs B=1, W=4 (proven optimal from EXP-BW). All cores share
+/// a single Arc<GlobalIoBudget> that caps total device queue depth.
+///
+/// Run: BENCH_DIR=/mnt/nvme/bench COHERE_N=100000 cargo test --release \
+///   -p divergence-engine --test disk_search exp_qd -- --nocapture
+#[test]
+fn exp_qd_multicore_sweep() {
+    use std::sync::{Arc, Mutex};
+    use divergence_engine::{GlobalIoBudget, WorkerConfig, spawn_worker};
+
+    let max_n: usize = std::env::var("COHERE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000);
+
+    let dataset_dir = std::env::var("COHERE_DIR").unwrap_or_else(|_| {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        format!("{}/../../data/cohere_100k", manifest)
+    });
+
+    let (vectors, queries_flat, ground_truth, n, nq, dim, k) =
+        match load_cohere_dataset(&dataset_dir, max_n) {
+            Some(d) => d,
+            None => return,
+        };
+
+    let m_max = 32;
+    let ef_construction = 200;
+    let ef = 200;
+    let w = 4; // fixed prefetch window (proven optimal)
+    let prefetch_budget = 4;
+    let num_queries = nq.min(100);
+
+    let core_counts = [1usize, 2, 4, 8];
+    let global_qds = [4usize, 8, 12, 16, 24, 32];
+
+    eprintln!("\n========== EXP-QD: MULTI-CORE QD SWEEP ==========");
+    eprintln!(
+        "n={}, dim={}, k={}, ef={}, W={}, nq={}, pf_budget={}",
+        n, dim, k, ef, w, num_queries, prefetch_budget
+    );
+
+    // Build NSW index
+    eprintln!("Building NSW index (m_max={}, ef_c={}) ...", m_max, ef_construction);
+    let config = NswConfig::new(m_max, ef_construction);
+    let builder = NswBuilder::new(config, dim, MetricType::Cosine, n);
+    for i in 0..n {
+        builder.insert(VectorId(i as u32), &vectors[i * dim..(i + 1) * dim]);
+    }
+    let index = builder.build();
+    eprintln!("  Index built");
+
+    // Write to disk
+    let bench_dir = std::env::var("BENCH_DIR").ok();
+    let direct_io = bench_dir.is_some();
+    let _tmpdir;
+    let dir_path: std::path::PathBuf;
+    if let Some(ref bd) = bench_dir {
+        dir_path = std::path::PathBuf::from(bd);
+        std::fs::create_dir_all(&dir_path).unwrap();
+    } else {
+        _tmpdir = tempfile::tempdir().unwrap();
+        dir_path = _tmpdir.path().to_path_buf();
+    }
+    let dir_str = dir_path.to_str().unwrap().to_owned();
+    let writer = IndexWriter::new(&dir_path);
+    writer
+        .write(
+            n as u32, dim, "cosine", index.max_degree(), ef_construction,
+            &index.entry_set().iter().map(|v| v.0).collect::<Vec<_>>(),
+            index.vectors_raw(), |vid| index.neighbors(vid),
+        )
+        .unwrap();
+    eprintln!("  Index written to {} (direct_io={})", dir_str, direct_io);
+
+    // Load shared data
+    let disk_vectors: Arc<[f32]> = Arc::from(
+        load_vectors(&dir_path.join("vectors.dat"), n, dim).unwrap().as_slice(),
+    );
+    let entry_set: Arc<[VectorId]> = {
+        let meta = IndexMeta::load_from(&dir_path.join("meta.json")).unwrap();
+        Arc::from(meta.entry_set.iter().map(|&v| VectorId(v)).collect::<Vec<_>>().as_slice())
+    };
+    let query_vecs: Arc<[Vec<f32>]> = Arc::from(
+        queries_flat.chunks_exact(dim).take(num_queries).map(|c| c.to_vec()).collect::<Vec<_>>().as_slice(),
+    );
+    let ground_truth: Arc<[Vec<u32>]> = Arc::from(ground_truth.as_slice());
+
+    // Pool sized to ~5% of dataset blocks
+    let pool_bytes = (n / 20) * 4096;
+    eprintln!(
+        "  Pool per core: {}KB ({:.0}% of {} blocks)",
+        pool_bytes / 1024,
+        pool_bytes as f64 / (n * 4096) as f64 * 100.0,
+        n
+    );
+
+    eprintln!(
+        "\n{:<6} {:<6} {:<6} {:>7} {:>8} {:>8} {:>8} {:>8} {:>7} {:>7}",
+        "cores", "gQD", "lQD", "r@k", "qps", "p50us", "p99us", "p999us", "sem_w%", "dev_w%"
+    );
+
+    // Per-core adj_capacity: give each core a fair share but at least 2
+    // (need room for search + prefetch)
+    for &num_cores in &core_counts {
+        for &gqd in &global_qds {
+            let per_core_qd = (gqd / num_cores).max(2).min(16);
+            let budget = Arc::new(GlobalIoBudget::new(gqd));
+
+            // Shared results collector
+            struct CoreResult {
+                recalls: Vec<f64>,
+                raw_us: Vec<f64>,
+                sem_ns: u64,
+                dev_ns: u64,
+            }
+            let results: Arc<Mutex<Vec<CoreResult>>> = Arc::new(Mutex::new(Vec::new()));
+
+            // Split queries across cores (round-robin assignment)
+            let queries_per_core = (num_queries + num_cores - 1) / num_cores;
+
+            let wall_start = std::time::Instant::now();
+
+            let mut handles = Vec::new();
+            for core_id in 0..num_cores {
+                let dir_str = dir_str.clone();
+                let budget = Arc::clone(&budget);
+                let results = Arc::clone(&results);
+                let disk_vecs = Arc::clone(&disk_vectors);
+                let es = Arc::clone(&entry_set);
+                let qvecs = Arc::clone(&query_vecs);
+                let gt = Arc::clone(&ground_truth);
+
+                let h = spawn_worker(
+                    WorkerConfig { core_id, uring_entries: 1024 },
+                    move || async move {
+                        let io = Rc::new(
+                            IoDriver::open_with_budget(
+                                &dir_str, dim, per_core_qd, direct_io,
+                                Some(budget),
+                            )
+                            .await
+                            .expect("failed to open IO driver"),
+                        );
+                        let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                        let bank = FP32SimdVectorBank::new(&disk_vecs, dim, MetricType::Cosine);
+
+                        // Spawn prefetch worker
+                        let pf_handle = AdjacencyPool::spawn_prefetch_worker(
+                            Rc::clone(&pool),
+                            Rc::clone(&io),
+                            prefetch_budget,
+                        );
+
+                        // Warmup (5 queries)
+                        for qi in 0..5.min(num_queries) {
+                            let mut perf = SearchPerfContext::default();
+                            disk_graph_search_pipe(
+                                &qvecs[qi], &es, k, ef, w, &pool, &io, &bank,
+                                &mut perf, PerfLevel::CountOnly,
+                            )
+                            .await;
+                        }
+                        io.take_io_timing(); // reset after warmup
+
+                        // Measure: this core handles queries [start..end)
+                        let start = core_id * queries_per_core;
+                        let end = (start + queries_per_core).min(num_queries);
+                        let mut recalls = Vec::new();
+                        let mut raw_us = Vec::new();
+
+                        for qi in start..end {
+                            let t = std::time::Instant::now();
+                            let mut perf = SearchPerfContext::default();
+                            let res = disk_graph_search_pipe(
+                                &qvecs[qi], &es, k, ef, w, &pool, &io, &bank,
+                                &mut perf, PerfLevel::EnableTime,
+                            )
+                            .await;
+                            raw_us.push(t.elapsed().as_nanos() as f64 / 1000.0);
+
+                            let ids: Vec<u32> = res.iter().map(|s| s.id.0).collect();
+                            recalls.push(recall_at_k(&ids, &gt[qi]));
+                        }
+
+                        let (sem_ns, dev_ns, _) = io.take_io_timing();
+
+                        pool.stop_prefetch();
+                        pf_handle.await;
+
+                        results.lock().unwrap().push(CoreResult {
+                            recalls,
+                            raw_us,
+                            sem_ns,
+                            dev_ns,
+                        });
+                    },
+                );
+                handles.push(h);
+            }
+
+            // Wait for all cores
+            for h in handles {
+                h.join().expect("worker thread panicked");
+            }
+
+            let wall_secs = wall_start.elapsed().as_secs_f64();
+            let total_queries = results.lock().unwrap().iter().map(|r| r.raw_us.len()).sum::<usize>();
+            let qps = total_queries as f64 / wall_secs;
+
+            // Aggregate stats across cores
+            let guard = results.lock().unwrap();
+            let mut all_us: Vec<f64> = guard.iter().flat_map(|r| r.raw_us.iter().copied()).collect();
+            let all_recalls: Vec<f64> = guard.iter().flat_map(|r| r.recalls.iter().copied()).collect();
+            let total_sem_ns: u64 = guard.iter().map(|r| r.sem_ns).sum();
+            let total_dev_ns: u64 = guard.iter().map(|r| r.dev_ns).sum();
+            drop(guard);
+
+            let mean_recall = all_recalls.iter().sum::<f64>() / all_recalls.len().max(1) as f64;
+            all_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let p50 = percentile(&all_us.iter().map(|&x| x as f64).collect::<Vec<_>>(), 50.0);
+            let p99 = percentile(&all_us.iter().map(|&x| x as f64).collect::<Vec<_>>(), 99.0);
+            let p999 = percentile(&all_us.iter().map(|&x| x as f64).collect::<Vec<_>>(), 99.9);
+
+            let io_total = total_sem_ns + total_dev_ns;
+            let sem_pct = if io_total > 0 { total_sem_ns as f64 / io_total as f64 * 100.0 } else { 0.0 };
+            let dev_pct = if io_total > 0 { total_dev_ns as f64 / io_total as f64 * 100.0 } else { 0.0 };
+
+            eprintln!(
+                "{:<6} {:<6} {:<6} {:>7.3} {:>8.1} {:>8.0} {:>8.0} {:>8.0} {:>7.1} {:>7.1}",
+                num_cores, gqd, per_core_qd, mean_recall, qps, p50, p99, p999, sem_pct, dev_pct,
+            );
+        }
+    }
+
+    eprintln!("\nEXP-QD sweep complete");
+}
+
