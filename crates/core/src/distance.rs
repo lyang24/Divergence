@@ -421,7 +421,8 @@ unsafe fn dot_fp32_avx(a: &[f32], b: &[f32]) -> f32 {
 /// Uses the widen-then-madd chain (AD-5):
 ///   load 32×i8 → split → cvtepi8_epi16 → madd_epi16 → add_epi32
 ///
-/// 2× unroll (64 elements/iteration), 2 independent i32 accumulators.
+/// 4× unroll (128 elements/iteration), 4 independent i32 accumulators
+/// to break loop-carried dependency chains. Uses ~12 of 16 ymm registers.
 /// Safe to ~66K dimensions (i32 overflow limit).
 ///
 /// # Safety
@@ -438,58 +439,74 @@ unsafe fn dot_i8_avx(a: &[i8], b: &[i8]) -> i32 {
 
         let mut acc0 = _mm256_setzero_si256();
         let mut acc1 = _mm256_setzero_si256();
+        let mut acc2 = _mm256_setzero_si256();
+        let mut acc3 = _mm256_setzero_si256();
 
-        let chunks = dim / 64;
+        let chunks = dim / 128;
         let mut i = 0usize;
 
-        // Main loop: 64 elements per iteration (2×32, AD-5 unroll ≥2×)
+        // Main loop: 128 elements per iteration (4×32, AD-5 unroll 4×)
         for _ in 0..chunks {
-            // Block 0: 32 elements
+            // Block 0: 32 elements → acc0
             let va0 = _mm256_lddqu_si256(a_ptr.add(i) as *const _);
             let vb0 = _mm256_lddqu_si256(b_ptr.add(i) as *const _);
-
-            // Split into low/high 128-bit halves, sign-extend i8 → i16
             let a0_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va0));
             let a0_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(va0, 1));
             let b0_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb0));
             let b0_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vb0, 1));
-
-            // madd_epi16: multiply pairs of i16, add adjacent → i32
             acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(a0_lo, b0_lo));
             acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(a0_hi, b0_hi));
 
-            // Block 1: next 32 elements (independent chain → acc1)
+            // Block 1: next 32 → acc1
             let va1 = _mm256_lddqu_si256(a_ptr.add(i + 32) as *const _);
             let vb1 = _mm256_lddqu_si256(b_ptr.add(i + 32) as *const _);
-
             let a1_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va1));
             let a1_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(va1, 1));
             let b1_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb1));
             let b1_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vb1, 1));
-
             acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(a1_lo, b1_lo));
             acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(a1_hi, b1_hi));
 
-            i += 64;
+            // Block 2: next 32 → acc2
+            let va2 = _mm256_lddqu_si256(a_ptr.add(i + 64) as *const _);
+            let vb2 = _mm256_lddqu_si256(b_ptr.add(i + 64) as *const _);
+            let a2_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va2));
+            let a2_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(va2, 1));
+            let b2_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb2));
+            let b2_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vb2, 1));
+            acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(a2_lo, b2_lo));
+            acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(a2_hi, b2_hi));
+
+            // Block 3: next 32 → acc3
+            let va3 = _mm256_lddqu_si256(a_ptr.add(i + 96) as *const _);
+            let vb3 = _mm256_lddqu_si256(b_ptr.add(i + 96) as *const _);
+            let a3_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va3));
+            let a3_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(va3, 1));
+            let b3_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb3));
+            let b3_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vb3, 1));
+            acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(a3_lo, b3_lo));
+            acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(a3_hi, b3_hi));
+
+            i += 128;
         }
 
-        // Handle remaining 32-element chunk
+        // Handle remaining 32-element chunks
         if i + 32 <= dim {
             let va = _mm256_lddqu_si256(a_ptr.add(i) as *const _);
             let vb = _mm256_lddqu_si256(b_ptr.add(i) as *const _);
-
             let a_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va));
             let a_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(va, 1));
             let b_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb));
             let b_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vb, 1));
-
             acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(a_lo, b_lo));
             acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(a_hi, b_hi));
             i += 32;
         }
 
-        // Merge two accumulators
+        // Merge four accumulators
         acc0 = _mm256_add_epi32(acc0, acc1);
+        acc2 = _mm256_add_epi32(acc2, acc3);
+        acc0 = _mm256_add_epi32(acc0, acc2);
 
         // Horizontal reduction: 8×i32 → scalar i32
         let hi128 = _mm256_extracti128_si256(acc0, 1);
@@ -518,86 +535,137 @@ fn dot_i8_scalar(a: &[i8], b: &[i8]) -> i32 {
         .sum()
 }
 
+/// Compute int8 dot product, dispatching to SIMD or scalar.
+#[inline]
+fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { dot_i8_avx(a, b) };
+        }
+    }
+    dot_i8_scalar(a, b)
+}
+
 // ---------------------------------------------------------------------------
 // Int8 VectorBank — pre-quantized i8 vectors + SIMD dot kernel
 // ---------------------------------------------------------------------------
 
+/// Quantize a single f32 vector to i8. Pre-normalized vectors only (AD-4).
+#[inline]
+fn quantize_f32_to_i8(src: &[f32], dst: &mut [i8]) {
+    for i in 0..src.len() {
+        let v = (src[i] * 127.0).round();
+        dst[i] = v.clamp(-127.0, 127.0) as i8;
+    }
+}
+
 /// Int8 vector bank for cheap cosine distance on pre-normalized vectors.
 ///
-/// Stores pre-quantized i8 vectors. On distance call, the f32 query is
-/// quantized once (cached), then int8 dot product is computed via SIMD.
+/// Stores pre-quantized i8 vectors. Does NOT cache the quantized query —
+/// use `Int8PreparedBank` for batch distance calls within a single query.
 ///
-/// Distance = -(dot_i8 as f32) / (127.0 * 127.0)
-///
-/// This gives a value proportional to negative cosine similarity:
-/// smaller = more similar, matching the VectorBank distance convention.
+/// The `VectorBank::distance()` implementation quantizes the query inline
+/// every call (correct but slow). For search, use `prepare()` to get an
+/// `Int8PreparedBank` that pre-quantizes once.
 pub struct Int8VectorBank<'a> {
     codes: &'a [i8],
     dim: usize,
-    /// Cached quantized query. RefCell because VectorBank::distance takes &self.
-    cached_query: std::cell::RefCell<CachedInt8Query>,
-}
-
-struct CachedInt8Query {
-    /// The original f32 query pointer (for cache invalidation).
-    query_ptr: *const f32,
-    /// Quantized query.
-    query_i8: Vec<i8>,
 }
 
 impl<'a> Int8VectorBank<'a> {
     pub fn new(codes: &'a [i8], dim: usize) -> Self {
-        Self {
-            codes,
-            dim,
-            cached_query: std::cell::RefCell::new(CachedInt8Query {
-                query_ptr: std::ptr::null(),
-                query_i8: vec![0i8; dim],
-            }),
+        Self { codes, dim }
+    }
+
+    /// Prepare a query for efficient batch distance computation.
+    /// Quantizes the f32 query to i8 once. The returned `Int8PreparedBank`
+    /// implements `VectorBank` and uses the pre-quantized query.
+    ///
+    /// Lifetime: tied to this bank AND the search call. Create once per query,
+    /// drop after search completes. Never reuse across different queries.
+    pub fn prepare<'b>(&'b self, query: &[f32]) -> Int8PreparedBank<'b>
+    where
+        'a: 'b,
+    {
+        let mut query_i8 = vec![0i8; self.dim];
+        quantize_f32_to_i8(query, &mut query_i8);
+        Int8PreparedBank {
+            codes: self.codes,
+            dim: self.dim,
+            query_i8,
         }
     }
 
-    /// Quantize a query, reusing cached result if same query pointer.
+    /// Prepare from a pre-quantized i8 query (e.g., per-dim quantized externally).
+    /// Caller is responsible for ensuring query_i8 was quantized with the same
+    /// scheme used for the stored codes.
+    pub fn prepare_raw<'b>(&'b self, query_i8: &[i8]) -> Int8PreparedBank<'b>
+    where
+        'a: 'b,
+    {
+        debug_assert_eq!(query_i8.len(), self.dim);
+        Int8PreparedBank {
+            codes: self.codes,
+            dim: self.dim,
+            query_i8: query_i8.to_vec(),
+        }
+    }
+
+    /// Raw int8 dot product between a pre-quantized query and stored vector.
     #[inline]
-    fn quantize_query(&self, query: &[f32]) {
-        let mut cached = self.cached_query.borrow_mut();
-        if cached.query_ptr == query.as_ptr() {
-            return;
-        }
-        for i in 0..self.dim {
-            let v = (query[i] * 127.0).round();
-            cached.query_i8[i] = v.clamp(-127.0, 127.0) as i8;
-        }
-        cached.query_ptr = query.as_ptr();
+    pub fn distance_raw(&self, query_i8: &[i8], vid: usize) -> i32 {
+        let offset = vid * self.dim;
+        let v = &self.codes[offset..offset + self.dim];
+        dot_i8(query_i8, v)
     }
 }
 
 impl VectorBank for Int8VectorBank<'_> {
     fn distance(&self, query: &[f32], vid: usize) -> f32 {
-        self.quantize_query(query);
-        let cached = self.cached_query.borrow();
+        // Slow path: quantizes query every call. Use prepare() for batch.
+        let mut query_i8 = vec![0i8; self.dim];
+        quantize_f32_to_i8(query, &mut query_i8);
+        let dot = self.distance_raw(&query_i8, vid);
+        // Raw integer negate — no float division (AD-3 ranking optimization)
+        -(dot as f32)
+    }
+
+    fn num_vectors(&self) -> usize {
+        self.codes.len() / self.dim
+    }
+
+    fn dimension(&self) -> usize {
+        self.dim
+    }
+}
+
+/// Pre-quantized int8 bank for efficient batch distance within a single query.
+///
+/// Created via `Int8VectorBank::prepare(query)`. Holds the pre-quantized query
+/// and implements `VectorBank` without re-quantizing on each `distance()` call.
+///
+/// Distance = -(dot_i8 as f32). Pure integer ranking — no float division.
+/// The scale factor (127²) is a monotonic constant that doesn't affect ordering.
+pub struct Int8PreparedBank<'a> {
+    codes: &'a [i8],
+    dim: usize,
+    query_i8: Vec<i8>,
+}
+
+impl Int8PreparedBank<'_> {
+    /// Raw int8 dot product (exposed for callers that need the integer value).
+    #[inline]
+    pub fn distance_raw(&self, vid: usize) -> i32 {
         let offset = vid * self.dim;
         let v = &self.codes[offset..offset + self.dim];
+        dot_i8(&self.query_i8, v)
+    }
+}
 
-        let dot = {
-            #[cfg(target_arch = "x86_64")]
-            {
-                if is_x86_feature_detected!("avx2") {
-                    unsafe { dot_i8_avx(&cached.query_i8, v) }
-                } else {
-                    dot_i8_scalar(&cached.query_i8, v)
-                }
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                dot_i8_scalar(&cached.query_i8, v)
-            }
-        };
-
-        // Convert to distance: -(dot / (127*127))
-        // For pre-normalized vectors: dot/(127^2) ≈ cosine_similarity
-        // Negate so smaller = more similar (VectorBank convention)
-        -(dot as f32) / (127.0 * 127.0)
+impl VectorBank for Int8PreparedBank<'_> {
+    fn distance(&self, _query: &[f32], vid: usize) -> f32 {
+        -(self.distance_raw(vid) as f32)
     }
 
     fn num_vectors(&self) -> usize {
@@ -920,14 +988,24 @@ mod tests {
         let bank = Int8VectorBank::new(&codes, dim);
         assert_eq!(bank.num_vectors(), 2);
 
-        // Query = v0 → distance to v0 ≈ 0 (self), distance to v1 ≈ big (orthogonal)
-        let d0 = bank.distance(&v0, 0);
-        let d1 = bank.distance(&v0, 1);
-        // d0 should be close to -1 (negative cosine similarity of identical)
-        // d1 should be close to 0 (orthogonal)
+        // Use prepare() for batch — this is the fast path
+        let prepared = bank.prepare(&v0);
+
+        // Query = v0 → distance to v0 should be very negative (self-similarity)
+        // Query = v0 → distance to v1 should be near 0 (orthogonal)
+        let d0 = prepared.distance(&v0, 0);
+        let d1 = prepared.distance(&v0, 1);
+        // d0 = -(dot of self) = large negative number (high similarity)
+        // d1 = -(dot of orthogonal) = near 0
         assert!(d0 < d1, "self should be closer: d0={} d1={}", d0, d1);
-        assert!(d0 < -0.9, "self-distance should be near -1: d0={}", d0);
-        assert!(d1.abs() < 0.05, "orthogonal distance should be near 0: d1={}", d1);
+        assert!(d0 < -5000.0, "self-distance should be large negative: d0={}", d0);
+        assert!(d1.abs() < 100.0, "orthogonal distance should be near 0: d1={}", d1);
+
+        // Verify raw dot values make sense
+        let raw0 = prepared.distance_raw(0);
+        let raw1 = prepared.distance_raw(1);
+        assert!(raw0 > 0, "self dot should be positive: raw0={}", raw0);
+        assert!(raw1.abs() < 100, "orthogonal dot should be near 0: raw1={}", raw1);
     }
 
     #[test]
@@ -957,11 +1035,12 @@ mod tests {
         l2_normalize(&mut query);
 
         let int8_bank = Int8VectorBank::new(&codes, dim);
+        let prepared = int8_bank.prepare(&query);
         let fp32_bank = FP32SimdVectorBank::new(&flat, dim, MetricType::Cosine);
 
         // Check rank correlation: int8 and fp32 should agree on ordering
         let mut int8_dists: Vec<(usize, f32)> = (0..n)
-            .map(|i| (i, int8_bank.distance(&query, i)))
+            .map(|i| (i, prepared.distance(&query, i)))
             .collect();
         let mut fp32_dists: Vec<(usize, f32)> = (0..n)
             .map(|i| (i, fp32_bank.distance(&query, i)))
@@ -1278,12 +1357,13 @@ mod tests {
         }
         let fp32_per_call = t.elapsed().as_nanos() as f64 / (n_iters * n_vectors) as f64;
 
-        // --- Int8 SIMD ---
+        // --- Int8 SIMD (prepared — no per-call quantization) ---
         let bank_i8 = Int8VectorBank::new(&codes, dim);
-        for vid in 0..n_vectors { sink += bank_i8.distance(&query, vid); }
+        let prepared = bank_i8.prepare(&query);
+        for vid in 0..n_vectors { sink += prepared.distance(&query, vid); }
         let t = Instant::now();
         for _ in 0..n_iters {
-            for vid in 0..n_vectors { sink += bank_i8.distance(&query, vid); }
+            for vid in 0..n_vectors { sink += prepared.distance(&query, vid); }
         }
         let i8_per_call = t.elapsed().as_nanos() as f64 / (n_iters * n_vectors) as f64;
 

@@ -44,6 +44,76 @@ impl ScalarQuantizer {
     }
 }
 
+/// Per-dimension scalar quantization: f32 → i8 with per-dim scale.
+///
+/// Each dimension gets its own scale based on the 99.9th percentile of |x[d]|
+/// across the training set. This captures per-dimension variance better than
+/// a uniform scale=1 (which assumes all dims have similar range).
+///
+/// For pre-normalized cosine vectors, most dims are in [-0.1, 0.1] with a few
+/// "important" dims reaching [-0.3, 0.3]. Uniform scale=1 wastes dynamic range
+/// on the majority of dims. Per-dim scale uses the full [-127, 127] range for
+/// each dimension.
+pub struct PerDimScalarQuantizer {
+    dim: usize,
+    /// Per-dim scale: code[d] = clamp(round(x[d] / scale[d] * 127), -127, 127)
+    scales: Vec<f32>,
+    /// Pre-computed 1/scale for the encode path
+    inv_scales: Vec<f32>,
+}
+
+impl PerDimScalarQuantizer {
+    /// Train from a batch of L2-normalized vectors. `data` is flat (n * dim).
+    pub fn train(data: &[f32], dim: usize) -> Self {
+        assert_eq!(data.len() % dim, 0);
+        let n = data.len() / dim;
+
+        let mut scales = vec![0.0f32; dim];
+        for d in 0..dim {
+            // Collect |x[d]| for all vectors
+            let mut abs_vals: Vec<f32> = (0..n)
+                .map(|i| data[i * dim + d].abs())
+                .collect();
+            abs_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+            // 99.9th percentile (robust to outliers)
+            let p999_idx = ((n as f64 * 0.999) as usize).min(n - 1);
+            let p999 = abs_vals[p999_idx];
+
+            // Floor: don't let scale go below 1e-6 (dead dims)
+            scales[d] = p999.max(1e-6);
+        }
+
+        let inv_scales: Vec<f32> = scales.iter().map(|&s| 127.0 / s).collect();
+        Self { dim, scales, inv_scales }
+    }
+
+    /// Quantize a single vector.
+    #[inline]
+    pub fn encode(&self, src: &[f32], dst: &mut [i8]) {
+        debug_assert_eq!(src.len(), self.dim);
+        debug_assert_eq!(dst.len(), self.dim);
+        for d in 0..self.dim {
+            let v = (src[d] * self.inv_scales[d]).round();
+            dst[d] = v.clamp(-127.0, 127.0) as i8;
+        }
+    }
+
+    /// Quantize a batch. `src` is flat (n * dim).
+    pub fn encode_batch(&self, src: &[f32]) -> Vec<i8> {
+        debug_assert_eq!(src.len() % self.dim, 0);
+        let mut dst = vec![0i8; src.len()];
+        for chunk in 0..(src.len() / self.dim) {
+            let s = chunk * self.dim;
+            self.encode(&src[s..s + self.dim], &mut dst[s..s + self.dim]);
+        }
+        dst
+    }
+
+    pub fn dim(&self) -> usize { self.dim }
+    pub fn scales(&self) -> &[f32] { &self.scales }
+}
+
 /// L2-normalize a vector in place. Returns the norm before normalization.
 pub fn l2_normalize(v: &mut [f32]) -> f32 {
     let norm_sq: f32 = v.iter().map(|x| x * x).sum();
