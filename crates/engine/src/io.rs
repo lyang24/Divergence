@@ -6,12 +6,13 @@
 //! LocalSemaphore is a single-threaded async semaphore (no Send needed since
 //! monoio is thread-per-core).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
+use std::time::Instant;
 
 use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -122,6 +123,12 @@ pub struct IoDriver {
     adj_sem: LocalSemaphore,
     adj_capacity: usize,
     dimension: usize,
+    /// Cumulative nanoseconds spent waiting for adj_sem permits (queue wait).
+    sem_wait_ns: Cell<u64>,
+    /// Cumulative nanoseconds spent in actual NVMe reads (device time).
+    device_ns: Cell<u64>,
+    /// Number of IO operations completed (for averaging).
+    io_count: Cell<u64>,
 }
 
 impl IoDriver {
@@ -149,18 +156,29 @@ impl IoDriver {
             adj_sem: LocalSemaphore::new(adj_inflight),
             adj_capacity: adj_inflight,
             dimension,
+            sem_wait_ns: Cell::new(0),
+            device_ns: Cell::new(0),
+            io_count: Cell::new(0),
         })
     }
 
     /// Read one 4KB adjacency block for the given vector ID.
     /// Acquires a semaphore permit, reads, releases on return.
     pub async fn read_adj_block(&self, vid: u32) -> io::Result<AlignedBuf> {
+        let t0 = Instant::now();
         let _permit = self.adj_sem.acquire().await;
+        let t1 = Instant::now();
 
         let buf = AlignedBuf::new(BLOCK_SIZE);
         let offset = vid as u64 * BLOCK_SIZE as u64;
 
         let (result, buf) = self.adj_file.read_at(buf, offset).await;
+        let t2 = Instant::now();
+
+        self.sem_wait_ns.set(self.sem_wait_ns.get() + (t1 - t0).as_nanos() as u64);
+        self.device_ns.set(self.device_ns.get() + (t2 - t1).as_nanos() as u64);
+        self.io_count.set(self.io_count.get() + 1);
+
         let n = result?;
         if n != BLOCK_SIZE {
             return Err(io::Error::new(
@@ -181,7 +199,9 @@ impl IoDriver {
         vid: u32,
         dst: crate::cache::SlotPtr,
     ) -> io::Result<()> {
+        let t0 = Instant::now();
         let _permit = self.adj_sem.acquire().await;
+        let t1 = Instant::now();
 
         // Safety: SlotPtr guarantees 4KB-aligned, BLOCK_SIZE-capacity memory
         // exclusively owned by the LOADING entry.
@@ -189,6 +209,12 @@ impl IoDriver {
         let offset = vid as u64 * BLOCK_SIZE as u64;
 
         let (result, _buf) = self.adj_file.read_at(buf, offset).await;
+        let t2 = Instant::now();
+
+        self.sem_wait_ns.set(self.sem_wait_ns.get() + (t1 - t0).as_nanos() as u64);
+        self.device_ns.set(self.device_ns.get() + (t2 - t1).as_nanos() as u64);
+        self.io_count.set(self.io_count.get() + 1);
+
         let n = result?;
         if n != BLOCK_SIZE {
             return Err(io::Error::new(
@@ -211,6 +237,14 @@ impl IoDriver {
     /// Number of adjacency IO permits currently available.
     pub fn available_adj_permits(&self) -> usize {
         self.adj_sem.available()
+    }
+
+    /// Snapshot and reset IO timing counters. Returns (sem_wait_ns, device_ns, io_count).
+    pub fn take_io_timing(&self) -> (u64, u64, u64) {
+        let s = self.sem_wait_ns.replace(0);
+        let d = self.device_ns.replace(0);
+        let c = self.io_count.replace(0);
+        (s, d, c)
     }
 }
 

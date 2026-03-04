@@ -3466,7 +3466,7 @@ fn exp_bw_overlap_sweep() {
     let num_queries = nq.min(100);
     let prefetch_budget = 4;
     let b_values = [1usize, 2, 4, 8];
-    let w_values = [0usize, 2, 4];
+    let w_values = [0usize, 1, 2, 4];
 
     eprintln!("\n========== EXP-BW: B×W OVERLAP SWEEP ==========");
     eprintln!(
@@ -3520,8 +3520,8 @@ fn exp_bw_overlap_sweep() {
         .collect();
 
     eprintln!(
-        "\n{:<4} {:<4} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>6} {:>6}",
-        "B", "W", "r@k", "qps", "p50us", "p99us", "p999us", "io_w%", "avg_ifl", "blk/q", "mis/q"
+        "\n{:<4} {:<4} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>6} {:>6} {:>7} {:>7}",
+        "B", "W", "r@k", "qps", "p50us", "p99us", "p999us", "io_w%", "avg_ifl", "blk/q", "mis/q", "sem_w%", "dev_w%"
     );
 
     let mut baseline_recall = 0.0f64;
@@ -3570,6 +3570,9 @@ fn exp_bw_overlap_sweep() {
                         .await;
                     }
                     drop(warmup_bank);
+
+                    // Reset IO timing counters after warmup
+                    io.take_io_timing();
 
                     // Measure pass: ceil(nq / B) batches of B concurrent queries
                     let mut raw_us: Vec<f64> = Vec::with_capacity(num_queries);
@@ -3633,6 +3636,9 @@ fn exp_bw_overlap_sweep() {
                     let wall_secs = wall_start.elapsed().as_secs_f64();
                     let qps = num_queries as f64 / wall_secs;
 
+                    // Snapshot IO timing split before stopping worker
+                    let (sem_ns, dev_ns, _io_cnt) = io.take_io_timing();
+
                     // Stop prefetch worker
                     pool.stop_prefetch();
                     pf_handle.await;
@@ -3665,9 +3671,20 @@ fn exp_bw_overlap_sweep() {
                     };
                     let blk_per_q = total_blocks_read as f64 / num_queries as f64;
                     let miss_per_q = total_blocks_miss as f64 / num_queries as f64;
+                    let io_total_ns = sem_ns + dev_ns;
+                    let sem_pct = if io_total_ns > 0 {
+                        sem_ns as f64 / io_total_ns as f64 * 100.0
+                    } else {
+                        0.0
+                    };
+                    let dev_pct = if io_total_ns > 0 {
+                        dev_ns as f64 / io_total_ns as f64 * 100.0
+                    } else {
+                        0.0
+                    };
 
                     eprintln!(
-                        "{:<4} {:<4} {:>7.3} {:>8.1} {:>8.0} {:>8.0} {:>8.0} {:>8.1} {:>8.2} {:>6.0} {:>6.0}",
+                        "{:<4} {:<4} {:>7.3} {:>8.1} {:>8.0} {:>8.0} {:>8.0} {:>8.1} {:>8.2} {:>6.0} {:>6.0} {:>7.1} {:>7.1}",
                         b,
                         w,
                         mean_recall,
@@ -3679,6 +3696,8 @@ fn exp_bw_overlap_sweep() {
                         avg_ifl,
                         blk_per_q,
                         miss_per_q,
+                        sem_pct,
+                        dev_pct,
                     );
 
                     if b == 1 && w == 0 {
