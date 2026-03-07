@@ -20,9 +20,9 @@ Four papers mapped to our codebase. Ordered by actionable impact.
 ### 1a. Flat graph is a sound engineering choice (FlatNav)
 
 Our `NswBuilder` produces a single-layer NSW graph with hub entry_set
-(selected by degree, `nsw.rs:420`). FlatNav shows that for d≥32, flat NSW
-achieves **comparable** latency and recall to full hierarchical HNSW on their
-benchmarks, with 18-39% less memory on 100M scale.
+(selected by degree, `crates/index/src/nsw.rs:420`). FlatNav shows that for
+d≥32, flat NSW achieves **comparable** latency and recall to full hierarchical
+HNSW on their benchmarks, with 18-39% less memory on 100M scale.
 
 This is strong evidence that hierarchy is **not worth the complexity** for our
 target dimensions (d≥96). But "comparable" ≠ "mathematically identical" — our
@@ -34,8 +34,8 @@ is empirical, not a proof.
 high and the evidence says the payoff is negligible at d≥96.
 
 **Caveat**: We are explicitly giving up hierarchy as an IO-reduction lever
-(see `io_reduction_research.md:170` — it IS one of only two known paths to
-<100 blk/q). Our path to winning IO is per-query stopping + inline codes +
+(see `docs/io_reduction_research.md:170` — it IS one of only two known paths
+to <100 blk/q). Our path to winning IO is per-query stopping + inline codes +
 layout, not hierarchy. Acknowledge the tradeoff.
 
 ### 1b. SQ is the right graph-traversal distance (VSAG)
@@ -47,25 +47,31 @@ dimensions, fully utilizes SIMD.
 
 **Decision**: Our Int8 SQ approach is correct for **CPU-side compute
 speedup**. But Int8 is NOT an IO optimization — our own EXP-0 proved this:
-at iso-recall, blk_ratio = 1.00 (`io_reduction_research.md:59-67`). Both
-precisions need the same ef and therefore the same blocks. Int8's 1.58x
+at iso-recall, blk_ratio = 1.00 (`docs/io_reduction_research.md:59-67`).
+Both precisions need the same ef and therefore the same blocks. Int8's 1.58x
 speedup is purely CPU-side and won't survive NVMe IO latency.
 
 PQ is still relevant for **inline codes** in adjacency blocks (Tier 3a) —
-small PQ codes for approximate next-hop scoring is a different use case than
-primary graph distance.
+but the purpose is NOT to replace the traversal distance function. The purpose
+is to **reduce the number of expansions that require a `get_or_load` IO**: score
+neighbor candidates using cheap inline PQ codes, only issue a real adjacency
+IO for the candidates that look promising. The PQ score is a gate, not a
+replacement for SQ/FP32 traversal distance.
 
 ### 1c. Prefetch scheduling hides latency (VSAG)
 
 VSAG ablation: basic software prefetch = 17% QPS boost; stride prefetch adds
 marginal improvement; deterministic access (batch-filter visited before
 prefetch) = 70% QPS on GIST1M. Our prefetch_hint + prefetch_worker already
-implements this at the IO level (`cache.rs:692`, `search.rs:475-486`).
+implements this at the IO level (`crates/engine/src/cache.rs:692`,
+`crates/engine/src/search.rs:476`).
 
-**Important caveat**: Prefetch hides latency but does NOT reduce blk/q. We
-measured this: blk/q stays at 201 regardless of W (`EXP-P1`). The fundamental
-IO count is determined by ef and graph structure. Prefetch is a necessary
-optimization but not the path to <100 blk/q.
+**Important caveat**: Prefetch hides latency but does NOT reduce blk/q.
+Structurally, prefetch does not change the expansion count — blk/q is
+determined by ef and the termination condition, not by whether blocks are
+pre-loaded (see `docs/io_reduction_research.md:130`: blk/q = ef+1 is a hard
+property of beam search). Prefetch is a necessary latency optimization but
+not the path to <100 blk/q.
 
 ---
 
@@ -90,9 +96,13 @@ FDL_cosine ~ N(1 - mu_CS, sigma_CS²)
 - Sample 200 vectors as proxy queries → build (score → ef) lookup table
 
 **Online** (per-query, microseconds):
-1. During first 2 hops of search (already happening), collect distance samples
-2. Compute query score: bin distances into Gaussian quantiles, exponential-weighted sum
-3. Lookup ef from table → set as search budget
+1. Compute FDL parameters (mu, sigma) from query vector + offline stats
+2. After seeding from entry_set, use the seed distances (distances to the
+   `num_entry_points` hub nodes) as the sample for difficulty estimation.
+   These distances are computed before the main expansion loop begins — no
+   extra work needed.
+3. Bin seed distances into Gaussian quantile bins, compute exponential-weighted
+   score, lookup (ef, stall_limit, drain_budget) from table.
 
 **Impact**: Converts our fixed blk/q ≈ ef (201 blocks) into adaptive:
 - Easy queries (majority): ef=80-120 → 40-60% IO reduction
@@ -100,24 +110,27 @@ FDL_cosine ~ N(1 - mu_CS, sigma_CS²)
 - Ada-ef achieves **4x latency reduction** vs static ef at same recall
 
 **Combines with our adaptive stopping**: Ada-ef estimates query difficulty
-early → selects per-query (ef, stall_limit, drain_budget) triple. Stall
-detector then exits early within that budget. Double savings.
+from seed distances → selects per-query (ef, stall_limit, drain_budget)
+triple. Stall detector then exits early within that budget. Double savings.
 
 **Key parameters**: m=5 bins, delta=0.001, 200 offline samples,
-exponential weights w_i = 100·e^(-i+1), 2-hop distance collection.
+exponential weights w_i = 100·e^(-i+1).
 
-**Implementation sketch** (~200 lines):
-1. `struct FdlStats { mean: Vec<f32>, cov_diag: Vec<f32> }` (start diagonal-only)
-2. `fn estimate_difficulty(query, distances_2hop, stats, table) -> (usize, u32, u32)`
+**Integration approach** (chosen — "estimate before main loop"):
+1. `struct FdlStats { mean: Vec<f32>, cov_diag: Vec<f32> }` (diagonal-only)
+2. `fn estimate_difficulty(query, seed_distances, stats, table) -> (usize, u32, u32)`
    returns `(ef, stall_limit, drain_budget)` triple
-3. Integrate into `disk_graph_search_pipe`: after entry_set + first few
-   expansions, call estimate_difficulty. Set ef as the capacity going forward
-   (do NOT resize FixedCapacityHeap mid-search — `clear(new_capacity)` would
-   lose accumulated results). Instead, **start with a large ef and shrink the
-   termination condition**, or start from the estimated ef directly. The
-   simplest correct integration: estimate difficulty from entry_set distances
-   BEFORE the main expansion loop begins, then pass the chosen ef to the
-   heap constructor.
+3. In `disk_graph_search_pipe`: after seeding from entry_set (which already
+   computes distances to all entry points), call `estimate_difficulty` with
+   those distances. Use the returned ef to construct `FixedCapacityHeap` with
+   the right capacity from the start. Do NOT resize mid-search —
+   `FixedCapacityHeap::clear(new_capacity)` discards accumulated results
+   (`crates/index/src/heap.rs:50`).
+
+Why this approach: it requires zero changes to the main expansion loop.
+The difficulty estimation piggybacks on distances we already compute during
+entry_set seeding. The ef/stall_limit/drain_budget triple flows directly
+into existing parameters.
 
 ### 2b. Hub Pinning in AdjacencyPool (FlatNav) ★★
 
@@ -135,15 +148,22 @@ evicted under pressure despite being reused across nearly every query.
    `pin_count` value). The clock `referenced` bit alone is NOT sufficient —
    it gets cleared on sweep. True pinning requires the eviction loop to
    **skip entries where `hub_pinned == true`**, same as it already skips
-   `LOADING` and `pin_count > 0` entries (`cache.rs:717`).
+   `LOADING` and `pin_count > 0` entries (`crates/engine/src/cache.rs:717`).
 4. On engine startup: pre-load hub adjacency blocks into the pool
 
-**Expected impact**: With 5% cache (pool_bytes = n/20 * 4096), hub pinning
-would ensure the ~1000 most-accessed blocks never miss. Given hubs account
-for 40-70% of early-step visits, this converts the highest-frequency IO to
-guaranteed cache hits.
+**Capacity binding** (critical — without this, pre-load is wasted):
+- Hub slots are capped at **min(num_hubs, 5% of total cache slots)**. With
+  5% cache (pool_bytes = n/20 * 4096) for n=100K, that's 5000 slots total,
+  hub budget = 250 slots. For n=1M: 50K slots, hub budget = 2500 slots.
+- If the hub set exceeds the budget, truncate by access frequency (keep the
+  most-accessed hubs, drop the rest to normal evictable status).
+- Hub-pinned slots are excluded from the clock sweep's candidate pool.
+  Worst case: if all 8 ways in a set are hub-pinned, eviction for that set
+  fails (existing `evict_fail` / bypass path handles this).
 
-**Cost**: ~1% of cache capacity dedicated to hubs. Negligible.
+**Expected impact**: Given hubs account for 40-70% of early-step visits,
+pinning the top ~250 hubs converts the highest-frequency IOs to guaranteed
+cache hits, at a cost of 5% of cache capacity.
 
 ### 2c. Truncated Scalar Quantization — p99 range (VSAG)
 
@@ -152,9 +172,11 @@ resolution. On GIST1M, 99% of values < 0.3 but max = 1.0 → 70% of range
 unused. Using p99 as the quantization boundary preserves resolution.
 
 **Our situation**: We use uniform scale=1 for pre-normalized cosine vectors
-(all components in [-1,1]), quantize as `round(x * 127)`. Per-dim scale
-was tested and recall dropped to 0.377 — but that failure might be a
-**pipeline inconsistency bug** (query vs vector scale/offset mismatch),
+(all components in [-1,1]), quantize as `round(x * 127)`
+(`crates/core/src/distance.rs:556`). Per-dim scale was tested and recall
+dropped to 0.377 — **this failure must be reproduced and root-caused.
+Priority: check query/vector normalization consistency, scale/offset
+symmetry between quantize and distance paths.** It may be a pipeline bug,
 not proof that per-dim is fundamentally wrong.
 
 **Status**: Needs investigation, not a settled question.
@@ -162,8 +184,6 @@ not proof that per-dim is fundamentally wrong.
   outliers to use more of the int8 range for common values.
 - For pre-normalized cosine, components are bounded [-1,1] but the actual
   distribution may be much tighter. Check empirically on Cohere embeddings.
-- The per-dim recall failure should be re-examined for implementation bugs
-  before writing it off as a design constraint.
 
 ---
 
@@ -172,26 +192,31 @@ not proof that per-dim is fundamentally wrong.
 ### 3a. Inline Compressed Codes (VSAG PRS + PageANN)
 
 VSAG's PRS = PageANN's inline compressed neighbors. Co-locate compressed
-neighbor codes with adjacency list in the same block. Enables zero-IO
-approximate scoring for next-hop candidates.
+neighbor codes with adjacency list in the same block. Purpose: **reduce the
+number of candidates that require a real `get_or_load` IO** — score neighbors
+using cheap inline codes, only expand the promising ones.
 
 Our adjacency block wastes most of its 4KB:
 ```
 Current:  [degree(u16) | padding(6B) | neighbor_vids(u32 × 32)] = 136 bytes used, 3960 wasted
 ```
 
-**The hard constraint** (`io_reduction_research.md:267-272`): at d=768, int8
-codes are 768 bytes/neighbor. With degree=32: 24KB. **Does NOT fit in 4KB.**
+**The hard constraint** (`docs/io_reduction_research.md:267-272`): at d=768,
+int8 codes are 768 bytes/neighbor. With degree=32: 24KB. **Does NOT fit.**
 
 Viable inline code options:
-- **PQ16×8 = 16 bytes/neighbor** → 32 × 16 = 512B → fits easily with room to spare
-- **RaBitQ / 4-bit = ~96 bytes/neighbor** → 32 × 96 = 3072B → fits in 4KB (tight)
+- **PQ16×8 = 16 bytes/neighbor** → 32 × 16 = 512B → fits with room to spare
+- **RaBitQ / 4-bit = ~96 bytes/neighbor** → 32 × 96 = 3072B → fits (tight)
 - **Top-N only**: store codes for 16 of 32 neighbors → halves cost
 
-**Do NOT write "PQ 64B" as the baseline** — that's 2048B for 32 neighbors,
-which fits but leaves no room for edge labels or other metadata. Prefer the
-smallest code that gives usable approximate scoring. PQ16×8 (16B) is the
-sweet spot: 512B total, leaves 3352B for labels/metadata/future use.
+Prefer the smallest code that gives usable approximate scoring. PQ16×8 (16B)
+is the sweet spot: 512B total, leaves 3352B for labels/metadata/future use.
+
+**Expected impact**: The goal is to reduce expansion count (or reduce the
+number of expansions that require an awaited cache miss). Effect must be
+validated with a blk/q curve — no unsubstantiated numbers. PageANN's Design
+Space reports 28% page-read reduction; our actual reduction depends on PQ
+scoring quality at d=768 with only 16 subspaces.
 
 This is the planned **Opt-A**. Depends on implementing a PQ codebook first.
 
@@ -205,11 +230,11 @@ alpha_e needed to retain it. At search time, filter edges by threshold.
 use m_s=32 (filter to effective degree 32) or m_s=16 for fast approximate
 search. No rebuild needed. 19x tuning time savings.
 
-**Block layout budget conflict**: Edge labels and inline codes both compete
-for the 4KB block. Per-edge label = 1 byte (alpha quantized to u8).
-32 edges × 1B = 32 bytes. This is negligible — labels and PQ16 codes can
-coexist: 136B (vids) + 32B (labels) + 512B (PQ16 codes) = 680B, well within
-4KB. But the block layout must be designed holistically — not piecemeal.
+**Block layout budget**: Edge labels and inline codes both compete for the
+4KB block. Per-edge label = 1 byte (alpha quantized to u8).
+32 edges × 1B = 32 bytes. Combined budget:
+136B (vids) + 32B (labels) + 512B (PQ16 codes) = 680B, well within 4KB.
+But the block layout must be designed holistically — not piecemeal.
 
 ### 3c. Search-Free Construction (PiPNN)
 
@@ -241,7 +266,7 @@ for our current NswBuilder output.
 
 | Insight | Why Not | Caveat |
 |---------|---------|--------|
-| HNSW hierarchical layers | Not worth the complexity at d≥96. | But it IS one of two known paths to <100 blk/q (`io_reduction_research.md:170`). We're betting on per-query stopping + inline codes instead. |
+| HNSW hierarchical layers | Not worth the complexity at d≥96. | But it IS one of two known paths to <100 blk/q (`docs/io_reduction_research.md:170`). We're betting on per-query stopping + inline codes instead. |
 | PRS hardware prefetch (VSAG) | CPU cache-line optimization. Our prefetch is IO-level (4KB blocks). | — |
 | VSAG's GBDT query classifier | Heavy offline training. Ada-ef achieves same goal with pure statistics, 50x less compute. | — |
 | PiPNN's build speed | Not a bottleneck at 100K. | Matters at 1M+. |
@@ -254,18 +279,19 @@ for our current NswBuilder output.
 
 | Priority | Feature | Source | What It Reduces | Effort |
 |----------|---------|--------|----------------|--------|
-| **P0** | Query-adaptive ef (FDL) | Ada-ef | blk/q (40-60% for easy queries) | ~200 LOC |
+| **P0** | Query-adaptive ef (FDL) | Ada-ef | blk/q (target: 40-60% for easy queries) | ~200 LOC |
 | **P1** | Hub pinning in cache | FlatNav | cache miss rate on hot nodes | ~80 LOC |
-| **P2** | Inline PQ16 codes (Opt-A) | VSAG+PageANN | blk/q (score before expand) | ~500 LOC + PQ impl |
+| **P2** | Inline PQ16 codes (Opt-A) | VSAG+PageANN | blk/q (gate before expand, effect TBD) | ~500 LOC + PQ impl |
 | **P3** | Edge labeling | VSAG | per-query degree tuning | ~100 LOC |
 | **P4** | RobustPrune final pass | PiPNN | graph quality (+10% QPS) | ~50 LOC |
 | **P5** | Search-free construction | PiPNN | build time at scale | ~800 LOC |
 
 **The path to <100 blk/q at recall≥0.96:**
-- P0 (Ada-ef) reduces blk/q for easy queries: 201 → ~100-120 on median
-- P2 (inline PQ16 codes) enables score-before-expand: skip ~50% of expansions
+- P0 (Ada-ef) reduces blk/q for easy queries: 201 → target ~100-120 on median
+- P2 (inline PQ16 codes) gates expansion on approximate score: reduction TBD
+  (PageANN reports 28% — our number depends on PQ quality at d=768/16 subspaces)
 - P1 (hub pinning) converts the most frequent misses to guaranteed hits
-- Combined: 3-4x effective IO reduction from current baseline
+- All reduction claims require blk/q curve validation before they're real.
 
 **What we're explicitly NOT doing**: hierarchy (complex, marginal for d≥96),
 PQ as primary graph distance (SQ is better for traversal), any ML-based
