@@ -50,5 +50,8 @@ libc = "0.2"
 # Error handling
 thiserror = "2"
 
+# Parallelism
+rayon = "1.10"
+
 # FP16
 half = "2"

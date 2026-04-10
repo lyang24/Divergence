@@ -16,3 +16,4 @@ libc = { workspace = true }
 tempfile = "3"
 rand = { workspace = true }
 rand_xoshiro = { workspace = true }
+rayon = { workspace = true }
