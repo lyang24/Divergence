@@ -101,6 +101,12 @@ pub struct SearchPerfContext {
     /// Times a non-top-1 candidate was chosen because its page was resident.
     pub page_sched_hits: u64,
 
+    // --- Free expansion diagnostics (always on) ---
+    /// Co-located VIDs scored for free (zero IO) when loading a page.
+    pub bonus_scored: u64,
+    /// Bonus scores that entered the beam (non-dominated).
+    pub bonus_pushed: u64,
+
     // --- PQ gating diagnostics (always on) ---
     /// Total neighbors scored with PQ approximate distance.
     pub pq_candidates_scored: u64,
@@ -801,6 +807,8 @@ mod tests {
             refine_bytes: 0,
             total_ns: 550_000,
             page_sched_hits: 0,
+            bonus_scored: 0,
+            bonus_pushed: 0,
         };
         let s = format!("{}", ctx);
         assert!(s.contains("blocks=50"));
