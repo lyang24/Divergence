@@ -753,6 +753,12 @@ pub async fn disk_graph_search_pipe_v3_traced(
 /// candidates first, at the cost of a bounded deviation from pure distance order.
 ///
 /// `page_sched_b = 0` disables scheduling (same as `disk_graph_search_pipe_v3`).
+///
+/// Note: co-resident record caching is implicit — the AdjacencyPool caches by
+/// page_id, so loading any VID on page P makes ALL other VIDs on page P a cache
+/// hit. With heavy_edge layout, co-located records are graph neighbors with high
+/// future access probability. This means page_sched_b > 1 is doubly effective:
+/// expanding a cached candidate also warms its page neighbors for future access.
 pub async fn disk_graph_search_pipe_v3_pagesched(
     query: &[f32],
     entry_set: &[VectorId],
@@ -772,6 +778,37 @@ pub async fn disk_graph_search_pipe_v3_pagesched(
     disk_graph_search_pipe_v3_inner(
         query, entry_set, k, ef, prefetch_window, stall_limit, drain_budget,
         pool, io, bank, adj_index, perf, level, None, page_sched_b,
+    ).await
+}
+
+/// Cache-aware beam search with VeloANN-style pivoting (default B=4).
+///
+/// Convenience wrapper over `disk_graph_search_pipe_v3_pagesched` with
+/// `page_sched_b=4`, the optimal look-ahead window for high-dimensional
+/// data per VeloANN (PVLDB 2026, Zhao et al.).
+///
+/// Co-resident record caching is implicit: the AdjacencyPool caches entire
+/// 4KB pages keyed by page_id. With heavy_edge layout, each page holds ~31
+/// graph neighbors. Loading any one VID's page makes all co-located VIDs
+/// instant cache hits — turning 1 physical read into ~30 future hits.
+pub async fn disk_graph_search_pipe_v3_cacheaware(
+    query: &[f32],
+    entry_set: &[VectorId],
+    k: usize,
+    ef: usize,
+    prefetch_window: usize,
+    stall_limit: u32,
+    drain_budget: u32,
+    pool: &AdjacencyPool,
+    io: &IoDriver,
+    bank: &dyn VectorBank,
+    adj_index: &[AdjIndexEntry],
+    perf: &mut SearchPerfContext,
+    level: PerfLevel,
+) -> Vec<ScoredId> {
+    disk_graph_search_pipe_v3_inner(
+        query, entry_set, k, ef, prefetch_window, stall_limit, drain_budget,
+        pool, io, bank, adj_index, perf, level, None, 4,
     ).await
 }
 

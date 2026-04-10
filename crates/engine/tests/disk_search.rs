@@ -14,6 +14,7 @@ use divergence_core::quantization::{PqCodebook, ScalarQuantizer, l2_normalize, l
 use divergence_core::{MetricType, VectorId};
 use divergence_engine::{
     disk_graph_search, disk_graph_search_exp, disk_graph_search_pipe, disk_graph_search_pipe_v3,
+    disk_graph_search_pipe_v3_cacheaware,
     disk_graph_search_pipe_v3_pagesched,
     disk_graph_search_pipe_v3_refine, disk_graph_search_pipe_v3_refine_3stage,
     disk_graph_search_pipe_v3_refine_fp16, disk_graph_search_pipe_v3_refine_int8,
@@ -10740,6 +10741,382 @@ fn exp_graphago() {
                 pool.stop_prefetch();
                 handle.await;
             }
+        });
+    }) {
+        eprintln!("Skipped: io_uring not available");
+    }
+}
+
+// =============================================================================
+// EXP-VELOANN-PHASE1: Co-Resident Caching + Cache-Aware Beam Search
+// =============================================================================
+//
+// Validates VeloANN Phase 1 techniques:
+// - Co-resident record caching is IMPLICIT (AdjacencyPool caches by page_id,
+//   so loading any VID on page P makes all co-located VIDs instant cache hits).
+// - Cache-aware beam search via pop_preferred with page_sched_b lookahead.
+//
+// Sweeps page_sched_b in {0, 2, 4, 8} under cold and warm cache modes.
+// Heavy_edge layout ensures co-located records are graph neighbors.
+
+#[test]
+#[ignore]
+fn exp_veloann_phase1() {
+    let max_n: usize = std::env::var("COHERE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000);
+
+    let dataset_dir = std::env::var("COHERE_DIR").unwrap_or_else(|_| {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        format!("{}/../../data/cohere_100k", manifest)
+    });
+
+    let (vectors, queries_flat, ground_truth, n, nq, dim, k) =
+        match load_cohere_dataset(&dataset_dir, max_n) {
+            Some(d) => d,
+            None => return,
+        };
+
+    let m_max = 32;
+    let ef_construction = 200;
+    let ef = 200;
+    let prefetch_width = 4;
+    let num_bench_queries = 100;
+    let warmup_queries = 20;
+    let cache_pct = 5usize;
+    let sched_b_values: &[usize] = &[0, 2, 4, 8];
+
+    let total_queries_needed = num_bench_queries + warmup_queries;
+    assert!(
+        nq >= total_queries_needed,
+        "Need {} queries but dataset has {}",
+        total_queries_needed,
+        nq
+    );
+
+    eprintln!(
+        "=== EXP-VELOANN-PHASE1: Cohere {}K, dim={}, k={}, ef={}, W={}, cache={}% ===",
+        n / 1000, dim, k, ef, prefetch_width, cache_pct
+    );
+
+    // 1. Build NSW index
+    eprintln!(
+        "Building NSW index (n={}, m_max={}, ef_c={}) ...",
+        n, m_max, ef_construction
+    );
+    let t0 = std::time::Instant::now();
+    let config = NswConfig::new(m_max, ef_construction);
+    let builder = NswBuilder::new(config, dim, MetricType::Cosine, n);
+    for (i, v) in vectors.chunks_exact(dim).enumerate() {
+        builder.insert(VectorId(i as u32), v);
+    }
+    let index = builder.build();
+    eprintln!("  Index built in {:.1}s", t0.elapsed().as_secs_f64());
+
+    let entry_ids: Vec<u32> = index.entry_set().iter().map(|v| v.0).collect();
+    let entry_set: Vec<VectorId> = index.entry_set().to_vec();
+
+    // 2. Setup directories
+    let bench_dir = std::env::var("BENCH_DIR").ok();
+    let direct_io = bench_dir.is_some();
+    let _tmpdir;
+    let base_dir: std::path::PathBuf;
+    if let Some(ref bd) = bench_dir {
+        base_dir = std::path::PathBuf::from(bd).join("veloann_phase1");
+        std::fs::create_dir_all(&base_dir).unwrap();
+    } else {
+        _tmpdir = tempfile::tempdir().unwrap();
+        base_dir = _tmpdir.path().to_path_buf();
+    }
+
+    // Write vectors.dat
+    let vec_dir = base_dir.clone();
+    let writer_base = IndexWriter::new(&vec_dir);
+    writer_base
+        .write(
+            n as u32,
+            dim,
+            "cosine",
+            index.max_degree(),
+            ef_construction,
+            &entry_ids,
+            index.vectors_raw(),
+            |vid| index.neighbors(vid),
+        )
+        .unwrap();
+    let disk_vectors = load_vectors(&vec_dir.join("vectors.dat"), n, dim).unwrap();
+
+    // 3. Build heavy_edge layout
+    eprintln!("Building heavy_edge layout ...");
+    let t0 = std::time::Instant::now();
+    let he_reorder = heavy_edge_reorder_graph(n, |vid| index.neighbors(vid));
+    eprintln!("  Reorder computed in {:.1}s", t0.elapsed().as_secs_f64());
+
+    let layout_dir = base_dir.join("heavy_edge");
+    std::fs::create_dir_all(&layout_dir).unwrap();
+    let w = IndexWriter::new(&layout_dir);
+    w.write_v3(
+        n as u32,
+        dim,
+        "cosine",
+        index.max_degree(),
+        ef_construction,
+        &entry_ids,
+        index.vectors_raw(),
+        |vid| index.neighbors(vid),
+        &he_reorder,
+        "heavy_edge",
+    )
+    .unwrap();
+    std::fs::copy(vec_dir.join("vectors.dat"), layout_dir.join("vectors.dat")).unwrap();
+    let meta = IndexMeta::load_from(&layout_dir.join("meta.json")).unwrap();
+    let num_pages = meta.num_pages.unwrap_or(0) as usize;
+    let adj_index = load_adj_index(&layout_dir.join("adj_index.dat"), n).unwrap();
+    eprintln!("  heavy_edge: {} pages", num_pages);
+
+    // Query slices
+    let bench_queries: Vec<Vec<f32>> = queries_flat
+        .chunks_exact(dim)
+        .take(num_bench_queries)
+        .map(|c| c.to_vec())
+        .collect();
+    let bench_gt: Vec<&Vec<u32>> = ground_truth.iter().take(num_bench_queries).collect();
+    let warmup_vecs: Vec<Vec<f32>> = queries_flat
+        .chunks_exact(dim)
+        .skip(num_bench_queries)
+        .take(warmup_queries)
+        .map(|c| c.to_vec())
+        .collect();
+
+    let dir_str = layout_dir.to_str().unwrap().to_owned();
+
+    if !with_runtime(|rt| {
+        rt.block_on(async {
+            let fp32_bank = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::Cosine);
+
+            // Print header
+            eprintln!(
+                "\n{:>8} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>12}",
+                "mode", "sched_b", "recall", "p50ms", "p99ms", "QPS",
+                "exp/q", "blk/q", "mis/q", "hit/q", "phy/q", "sched_hits/q"
+            );
+
+            for &sched_b in sched_b_values {
+                // === COLD mode: pool.clear() before each query ===
+                {
+                    let io = Rc::new(
+                        IoDriver::open_pages(&dir_str, dim, 64, direct_io)
+                            .await
+                            .expect("failed to open IO driver"),
+                    );
+                    let pool_pages = (num_pages * cache_pct / 100).max(256);
+                    let pool_bytes = pool_pages * 4096;
+                    let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                    let handle = AdjacencyPool::spawn_prefetch_worker(
+                        Rc::clone(&pool),
+                        Rc::clone(&io),
+                        prefetch_width,
+                    );
+
+                    let mut recalls = Vec::with_capacity(num_bench_queries);
+                    let mut latencies_ms = Vec::with_capacity(num_bench_queries);
+                    let mut sum_exp = 0u64;
+                    let mut sum_blk = 0u64;
+                    let mut sum_miss = 0u64;
+                    let mut sum_hit = 0u64;
+                    let mut sum_phys = 0u64;
+                    let mut sum_sched = 0u64;
+
+                    let wall_start = std::time::Instant::now();
+                    for qi in 0..num_bench_queries {
+                        pool.pause_prefetch(true);
+                        pool.drain_prefetch();
+                        monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+                        while pool.has_loading() {
+                            monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+                        }
+                        pool.clear();
+                        pool.pause_prefetch(false);
+
+                        let mut perf = SearchPerfContext::default();
+                        let t0 = std::time::Instant::now();
+                        let results = disk_graph_search_pipe_v3_pagesched(
+                            &bench_queries[qi],
+                            &entry_set,
+                            k,
+                            ef,
+                            prefetch_width,
+                            0,
+                            0,
+                            &pool,
+                            &io,
+                            &fp32_bank,
+                            &adj_index,
+                            &mut perf,
+                            PerfLevel::EnableTime,
+                            sched_b,
+                        )
+                        .await;
+                        latencies_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
+
+                        let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                        recalls.push(recall_at_k(&ids, bench_gt[qi]));
+
+                        sum_exp += perf.expansions;
+                        sum_blk += perf.blocks_read;
+                        sum_miss += perf.blocks_miss;
+                        sum_hit += perf.blocks_hit;
+                        sum_phys += perf.phys_reads;
+                        sum_sched += perf.page_sched_hits;
+                    }
+                    let wall_secs = wall_start.elapsed().as_secs_f64();
+
+                    let nq = num_bench_queries as f64;
+                    let avg_recall: f64 = recalls.iter().sum::<f64>() / nq;
+                    latencies_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let p50 = latencies_ms[(num_bench_queries as f64 * 0.50) as usize];
+                    let p99 = latencies_ms[((num_bench_queries as f64 * 0.99) as usize).min(num_bench_queries - 1)];
+                    let qps = nq / wall_secs;
+
+                    eprintln!(
+                        "{:>8} {:>6} {:>7.3} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>12.1}",
+                        "cold",
+                        sched_b,
+                        avg_recall,
+                        p50,
+                        p99,
+                        qps,
+                        sum_exp as f64 / nq,
+                        sum_blk as f64 / nq,
+                        sum_miss as f64 / nq,
+                        sum_hit as f64 / nq,
+                        sum_phys as f64 / nq,
+                        sum_sched as f64 / nq,
+                    );
+
+                    pool.stop_prefetch();
+                    handle.await;
+                }
+
+                // === WARM mode: warmup queries, then benchmark without clearing ===
+                {
+                    let io = Rc::new(
+                        IoDriver::open_pages(&dir_str, dim, 64, direct_io)
+                            .await
+                            .expect("failed to open IO driver"),
+                    );
+                    let pool_pages = (num_pages * cache_pct / 100).max(256);
+                    let pool_bytes = pool_pages * 4096;
+                    let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                    let handle = AdjacencyPool::spawn_prefetch_worker(
+                        Rc::clone(&pool),
+                        Rc::clone(&io),
+                        prefetch_width,
+                    );
+
+                    // Warmup
+                    for qi in 0..warmup_queries {
+                        let mut perf = SearchPerfContext::default();
+                        disk_graph_search_pipe_v3_pagesched(
+                            &warmup_vecs[qi],
+                            &entry_set,
+                            k,
+                            ef,
+                            prefetch_width,
+                            0,
+                            0,
+                            &pool,
+                            &io,
+                            &fp32_bank,
+                            &adj_index,
+                            &mut perf,
+                            PerfLevel::CountOnly,
+                            sched_b,
+                        )
+                        .await;
+                    }
+
+                    // Benchmark (warm — no pool.clear())
+                    let mut recalls = Vec::with_capacity(num_bench_queries);
+                    let mut latencies_ms = Vec::with_capacity(num_bench_queries);
+                    let mut sum_exp = 0u64;
+                    let mut sum_blk = 0u64;
+                    let mut sum_miss = 0u64;
+                    let mut sum_hit = 0u64;
+                    let mut sum_phys = 0u64;
+                    let mut sum_sched = 0u64;
+
+                    let wall_start = std::time::Instant::now();
+                    for qi in 0..num_bench_queries {
+                        let mut perf = SearchPerfContext::default();
+                        let t0 = std::time::Instant::now();
+                        let results = disk_graph_search_pipe_v3_pagesched(
+                            &bench_queries[qi],
+                            &entry_set,
+                            k,
+                            ef,
+                            prefetch_width,
+                            0,
+                            0,
+                            &pool,
+                            &io,
+                            &fp32_bank,
+                            &adj_index,
+                            &mut perf,
+                            PerfLevel::EnableTime,
+                            sched_b,
+                        )
+                        .await;
+                        latencies_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
+
+                        let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                        recalls.push(recall_at_k(&ids, bench_gt[qi]));
+
+                        sum_exp += perf.expansions;
+                        sum_blk += perf.blocks_read;
+                        sum_miss += perf.blocks_miss;
+                        sum_hit += perf.blocks_hit;
+                        sum_phys += perf.phys_reads;
+                        sum_sched += perf.page_sched_hits;
+                    }
+                    let wall_secs = wall_start.elapsed().as_secs_f64();
+
+                    let nq = num_bench_queries as f64;
+                    let avg_recall: f64 = recalls.iter().sum::<f64>() / nq;
+                    latencies_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let p50 = latencies_ms[(num_bench_queries as f64 * 0.50) as usize];
+                    let p99 = latencies_ms[((num_bench_queries as f64 * 0.99) as usize).min(num_bench_queries - 1)];
+                    let qps = nq / wall_secs;
+
+                    eprintln!(
+                        "{:>8} {:>6} {:>7.3} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>12.1}",
+                        "warm",
+                        sched_b,
+                        avg_recall,
+                        p50,
+                        p99,
+                        qps,
+                        sum_exp as f64 / nq,
+                        sum_blk as f64 / nq,
+                        sum_miss as f64 / nq,
+                        sum_hit as f64 / nq,
+                        sum_phys as f64 / nq,
+                        sum_sched as f64 / nq,
+                    );
+
+                    pool.stop_prefetch();
+                    handle.await;
+                }
+            }
+
+            eprintln!("\n--- Co-resident caching analysis ---");
+            eprintln!("AdjacencyPool caches by page_id (not VID). With heavy_edge layout:");
+            eprintln!("  - Each 4KB page holds ~31 adjacency records (130 bytes each at deg=32)");
+            eprintln!("  - Loading any VID on page P caches ALL records on P");
+            eprintln!("  - Co-resident caching is IMPLICIT — no extra code needed");
+            eprintln!("  - Look at hit/q in cold mode: higher hit/q = more co-resident hits");
+            eprintln!("  - page_sched_hits/q shows how often pivoting chose a cached candidate");
         });
     }) {
         eprintln!("Skipped: io_uring not available");
