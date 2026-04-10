@@ -13,7 +13,7 @@ use divergence_core::distance::VectorBank;
 use divergence_core::quantization::pq::PqDistanceTable;
 use divergence_core::VectorId;
 use divergence_index::{CandidateHeap, FixedCapacityHeap, ScoredId};
-use divergence_storage::{decode_adj_block, decode_adj_block_view, page_record_vid, AdjIndexEntry};
+use divergence_storage::{decode_adj_block, decode_adj_block_view, page_record_vid, page_decode_neighbors_compressed, AdjIndexEntry};
 
 use crate::cache::AdjacencyPool;
 use crate::io::IoDriver;
@@ -734,7 +734,7 @@ pub async fn disk_graph_search_pipe_v3(
 ) -> Vec<ScoredId> {
     disk_graph_search_pipe_v3_inner(
         query, entry_set, k, ef, prefetch_window, stall_limit, drain_budget,
-        pool, io, bank, adj_index, perf, level, None, 0, None,
+        pool, io, bank, adj_index, perf, level, None, 0, None, false,
     ).await
 }
 
@@ -758,7 +758,7 @@ pub async fn disk_graph_search_pipe_v3_traced(
 ) -> Vec<ScoredId> {
     disk_graph_search_pipe_v3_inner(
         query, entry_set, k, ef, prefetch_window, stall_limit, drain_budget,
-        pool, io, bank, adj_index, perf, level, Some(trace), 0, None,
+        pool, io, bank, adj_index, perf, level, Some(trace), 0, None, false,
     ).await
 }
 
@@ -793,7 +793,7 @@ pub async fn disk_graph_search_pipe_v3_pagesched(
 ) -> Vec<ScoredId> {
     disk_graph_search_pipe_v3_inner(
         query, entry_set, k, ef, prefetch_window, stall_limit, drain_budget,
-        pool, io, bank, adj_index, perf, level, None, page_sched_b, None,
+        pool, io, bank, adj_index, perf, level, None, page_sched_b, None, false,
     ).await
 }
 
@@ -824,7 +824,7 @@ pub async fn disk_graph_search_pipe_v3_cacheaware(
 ) -> Vec<ScoredId> {
     disk_graph_search_pipe_v3_inner(
         query, entry_set, k, ef, prefetch_window, stall_limit, drain_budget,
-        pool, io, bank, adj_index, perf, level, None, 4, None,
+        pool, io, bank, adj_index, perf, level, None, 4, None, false,
     ).await
 }
 
@@ -837,6 +837,7 @@ pub async fn disk_graph_search_pipe_v3_cacheaware(
 /// `page_to_vids`: inverted index from `build_page_to_vids`.
 /// `max_bonus_per_query`: cap on total bonus scores per query (e.g., 2000).
 /// `page_sched_b`: cache-aware pivoting lookahead (0=disabled, 4=default).
+/// `compressed_adj`: true for v4 delta-varint encoded adjacency.
 pub async fn disk_graph_search_pipe_v3_freeexp(
     query: &[f32],
     entry_set: &[VectorId],
@@ -854,11 +855,12 @@ pub async fn disk_graph_search_pipe_v3_freeexp(
     perf: &mut SearchPerfContext,
     level: PerfLevel,
     page_sched_b: usize,
+    compressed_adj: bool,
 ) -> Vec<ScoredId> {
     disk_graph_search_pipe_v3_inner(
         query, entry_set, k, ef, prefetch_window, stall_limit, drain_budget,
         pool, io, bank, adj_index, perf, level, None, page_sched_b,
-        Some((page_to_vids, max_bonus_per_query)),
+        Some((page_to_vids, max_bonus_per_query)), compressed_adj,
     ).await
 }
 
@@ -879,6 +881,7 @@ async fn disk_graph_search_pipe_v3_inner(
     mut trace: Option<&mut TraceRecorder>,
     page_sched_b: usize,
     freeexp: Option<(&[Vec<u32>], u64)>,  // (page_to_vids, max_bonus_per_query)
+    compressed_adj: bool,                  // v4: delta-varint compressed neighbors
 ) -> Vec<ScoredId> {
     let timing = level >= PerfLevel::EnableTime;
 
@@ -1042,9 +1045,20 @@ async fn disk_graph_search_pipe_v3_inner(
             entry.degree
         );
 
+        // Decode neighbor VIDs: v3 (uncompressed) or v4 (delta-varint)
+        let degree = entry.degree as usize;
+        let mut nbr_buf = [0u32; 256];
+        if compressed_adj {
+            page_decode_neighbors_compressed(page, &entry, &mut nbr_buf[..degree]);
+        } else {
+            for i in 0..degree {
+                nbr_buf[i] = page_record_vid(page, &entry, i);
+            }
+        }
+
         let mut added_this_expansion = 0u32;
-        for i in 0..(entry.degree as usize) {
-            let nbr_raw = page_record_vid(page, &entry, i);
+        for i in 0..degree {
+            let nbr_raw = nbr_buf[i];
             let nbr_idx = nbr_raw as usize;
             if nbr_idx >= num_vectors || visited[nbr_idx] {
                 continue;
@@ -1881,7 +1895,7 @@ pub async fn execute_query_batch(
             let results = disk_graph_search_pipe_v3_freeexp(
                 &q, &entry_c, k, ef, per_query_w, stall_limit, drain_budget,
                 &pool_c, &io_c, bank_c.as_ref(), &adj_c, &p2v_c,
-                max_bonus, &mut perf, level, page_sched_b,
+                max_bonus, &mut perf, level, page_sched_b, false,
             ).await;
             (results, perf)
         });

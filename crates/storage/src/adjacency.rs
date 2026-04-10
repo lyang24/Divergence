@@ -856,6 +856,207 @@ pub fn packed_record_size(degree: usize) -> usize {
     2 + degree * 4
 }
 
+// ---------------------------------------------------------------------------
+// v4: Delta-varint compressed adjacency
+// ---------------------------------------------------------------------------
+
+/// Encode a u32 as LEB128 varint, appending bytes to `buf`.
+#[inline]
+fn encode_varint(mut val: u32, buf: &mut Vec<u8>) {
+    loop {
+        let byte = (val & 0x7F) as u8;
+        val >>= 7;
+        if val == 0 {
+            buf.push(byte);
+            return;
+        }
+        buf.push(byte | 0x80);
+    }
+}
+
+/// Decode a u32 varint from a byte slice. Returns (value, bytes_consumed).
+#[inline]
+pub fn decode_varint(buf: &[u8]) -> (u32, usize) {
+    let mut val = 0u32;
+    let mut shift = 0;
+    for (i, &byte) in buf.iter().enumerate() {
+        val |= ((byte & 0x7F) as u32) << shift;
+        if byte & 0x80 == 0 {
+            return (val, i + 1);
+        }
+        shift += 7;
+        if shift >= 35 {
+            break;
+        }
+    }
+    (val, buf.len())
+}
+
+/// Encode sorted neighbor VIDs as delta-varint. Returns the encoded bytes.
+pub fn encode_delta_varint(neighbors: &[u32]) -> Vec<u8> {
+    let mut sorted = neighbors.to_vec();
+    sorted.sort_unstable();
+    let mut buf = Vec::with_capacity(sorted.len() * 2);
+    let mut prev = 0u32;
+    for &vid in &sorted {
+        let delta = vid.wrapping_sub(prev);
+        encode_varint(delta, &mut buf);
+        prev = vid;
+    }
+    buf
+}
+
+/// Decode `degree` delta-varint encoded neighbor VIDs from `data` into `out`.
+/// Returns the number of bytes consumed from `data`.
+#[inline]
+pub fn decode_delta_varint(data: &[u8], degree: usize, out: &mut [u32]) -> usize {
+    let mut pos = 0;
+    let mut prev = 0u32;
+    for i in 0..degree {
+        let (delta, consumed) = decode_varint(&data[pos..]);
+        prev = prev.wrapping_add(delta);
+        out[i] = prev;
+        pos += consumed;
+    }
+    pos
+}
+
+/// Decode all neighbor VIDs from a v4 compressed page record.
+///
+/// `page_buf`: the 4KB page data.
+/// `entry`: the AdjIndexEntry for this VID.
+/// `out`: output buffer (must have len >= entry.degree).
+///
+/// The record format is: [degree: u16][delta-varint encoded VIDs].
+#[inline]
+pub fn page_decode_neighbors_compressed(
+    page_buf: &[u8],
+    entry: &AdjIndexEntry,
+    out: &mut [u32],
+) -> usize {
+    let off = entry.offset as usize + 2; // skip degree u16
+    let degree = entry.degree as usize;
+    decode_delta_varint(&page_buf[off..], degree, &mut out[..degree])
+}
+
+/// Write v4 page-packed adjacency files with delta-varint compressed neighbor lists.
+///
+/// Same interface as `write_packed_adjacency` (v3), but records use
+/// delta-varint encoding for neighbor VIDs. Records are typically 40-60%
+/// smaller, fitting ~60+ records per 4KB page instead of ~31.
+///
+/// Returns the number of pages written.
+pub fn write_packed_adjacency_compressed<'a>(
+    pages_path: &Path,
+    index_path: &Path,
+    num_vectors: u32,
+    neighbors_fn: impl Fn(u32) -> &'a [u32],
+    reorder: &[u32],
+) -> io::Result<u32> {
+    let n = num_vectors as usize;
+    assert_eq!(reorder.len(), n);
+    if n == 0 {
+        std::fs::write(pages_path, &[] as &[u8])?;
+        std::fs::write(index_path, &[] as &[u8])?;
+        return Ok(0);
+    }
+
+    // Validate permutation
+    let mut seen = vec![0u8; (n + 7) / 8];
+    for &new in reorder {
+        let new = new as usize;
+        assert!(new < n, "reorder out of range: new_vid={new} n={n}");
+        let byte = new / 8;
+        let mask = 1u8 << (new % 8);
+        assert!(
+            (seen[byte] & mask) == 0,
+            "reorder is not a permutation: duplicate new_vid={new}"
+        );
+        seen[byte] |= mask;
+    }
+
+    // Build new_to_old
+    let mut new_to_old = vec![0u32; n];
+    for old in 0..n {
+        new_to_old[reorder[old] as usize] = old as u32;
+    }
+
+    // Pre-encode all adjacency lists to know compressed sizes
+    let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(n);
+    for old_vid in 0..n {
+        let nbrs = neighbors_fn(old_vid as u32);
+        encoded.push(encode_delta_varint(nbrs));
+    }
+
+    // First pass: compute record sizes and assign to pages
+    let mut adj_index = vec![AdjIndexEntry::default(); n];
+    let mut page_id = 0u32;
+    let mut page_used = 0usize;
+
+    for new_vid in 0..n {
+        let old_vid = new_to_old[new_vid] as usize;
+        let nbrs = neighbors_fn(old_vid as u32);
+        let degree = nbrs.len();
+        let record_bytes = 2 + encoded[old_vid].len(); // degree(u16) + varint data
+        assert!(
+            record_bytes <= BLOCK_SIZE,
+            "compressed adj record too large: vid={} degree={} bytes={} (page={})",
+            old_vid, degree, record_bytes, BLOCK_SIZE
+        );
+
+        if page_used + record_bytes > BLOCK_SIZE && page_used > 0 {
+            page_id += 1;
+            page_used = 0;
+        }
+
+        adj_index[old_vid] = AdjIndexEntry {
+            page_id,
+            offset: page_used as u16,
+            degree: degree as u16,
+        };
+        page_used += record_bytes;
+    }
+    let total_pages = page_id + 1;
+
+    // Second pass: write pages
+    let pages_file = File::create(pages_path)?;
+    let mut pages_writer = BufWriter::new(pages_file);
+    let mut page_buf = [0u8; BLOCK_SIZE];
+    let mut current_page = 0u32;
+    page_buf.fill(0);
+
+    for new_vid in 0..n {
+        let old_vid = new_to_old[new_vid] as usize;
+        let entry = adj_index[old_vid];
+
+        while current_page < entry.page_id {
+            pages_writer.write_all(&page_buf)?;
+            page_buf.fill(0);
+            current_page += 1;
+        }
+
+        let off = entry.offset as usize;
+        let degree = entry.degree;
+        let enc = &encoded[old_vid];
+
+        page_buf[off..off + 2].copy_from_slice(&degree.to_le_bytes());
+        page_buf[off + 2..off + 2 + enc.len()].copy_from_slice(enc);
+    }
+    // Flush last page
+    pages_writer.write_all(&page_buf)?;
+    pages_writer.flush()?;
+
+    // Write adj_index
+    let index_file = File::create(index_path)?;
+    let mut index_writer = BufWriter::new(index_file);
+    for entry in &adj_index {
+        index_writer.write_all(&entry.to_bytes())?;
+    }
+    index_writer.flush()?;
+
+    Ok(total_pages)
+}
+
 /// TWPP (Trace-Weighted Page Packing) reorder.
 ///
 /// Produces an `old_to_new` VID permutation that co-locates frequently
@@ -1422,5 +1623,88 @@ mod tests {
                 assert_eq!(actual, adj[vid][i], "vid={} neighbor {}", vid, i);
             }
         }
+    }
+
+    // ─── v4 compressed adjacency tests ───────────────────────────────────
+
+    #[test]
+    fn varint_roundtrip() {
+        let test_values: &[u32] = &[0, 1, 127, 128, 255, 256, 16383, 16384, 1_000_000, u32::MAX];
+        for &val in test_values {
+            let mut buf = Vec::new();
+            encode_varint(val, &mut buf);
+            let (decoded, consumed) = decode_varint(&buf);
+            assert_eq!(decoded, val, "varint roundtrip failed for {}", val);
+            assert_eq!(consumed, buf.len());
+        }
+    }
+
+    #[test]
+    fn delta_varint_roundtrip() {
+        let neighbors = vec![5, 100, 200, 50000, 99999];
+        let encoded = encode_delta_varint(&neighbors);
+        let mut decoded = [0u32; 5];
+        let consumed = decode_delta_varint(&encoded, 5, &mut decoded);
+        assert_eq!(consumed, encoded.len());
+        // decode produces sorted output
+        let mut sorted = neighbors.clone();
+        sorted.sort();
+        assert_eq!(&decoded[..], &sorted[..]);
+    }
+
+    #[test]
+    fn compressed_packing_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let pages_path = dir.path().join("pages.dat");
+        let index_path = dir.path().join("index.dat");
+
+        let n = 200u32;
+        let degree = 20;
+        // Generate deterministic adjacency
+        let adj: Vec<Vec<u32>> = (0..n as usize).map(|i| {
+            (0..degree).map(|j| ((i * 7 + j * 13) % n as usize) as u32).collect()
+        }).collect();
+
+        let reorder: Vec<u32> = (0..n).collect();
+        let total_pages = write_packed_adjacency_compressed(
+            &pages_path, &index_path, n,
+            |vid| &adj[vid as usize], &reorder,
+        ).unwrap();
+
+        // Load and verify
+        let adj_index = load_adj_index(&index_path, n as usize).unwrap();
+        let page_data = std::fs::read(&pages_path).unwrap();
+        assert_eq!(page_data.len(), total_pages as usize * BLOCK_SIZE);
+
+        for vid in 0..n as usize {
+            let entry = &adj_index[vid];
+            assert_eq!(entry.degree as usize, degree);
+            let page_start = entry.page_id as usize * BLOCK_SIZE;
+            let page_buf = &page_data[page_start..page_start + BLOCK_SIZE];
+
+            let mut decoded = [0u32; 32];
+            page_decode_neighbors_compressed(page_buf, entry, &mut decoded[..degree]);
+
+            // Decoded should match sorted original
+            let mut expected = adj[vid].clone();
+            expected.sort();
+            expected.dedup();
+            assert_eq!(&decoded[..degree], &expected[..], "vid={}", vid);
+        }
+
+        // v4 should produce fewer pages than v3
+        let v3_pages = write_packed_adjacency(
+            &dir.path().join("v3_pages.dat"),
+            &dir.path().join("v3_index.dat"),
+            n, |vid| &adj[vid as usize], &reorder,
+        ).unwrap();
+        assert!(
+            total_pages < v3_pages,
+            "v4 ({} pages) should be fewer than v3 ({} pages)",
+            total_pages, v3_pages
+        );
+        eprintln!("  v3: {} pages, v4: {} pages ({:.0}% reduction)",
+            v3_pages, total_pages,
+            (1.0 - total_pages as f64 / v3_pages as f64) * 100.0);
     }
 }

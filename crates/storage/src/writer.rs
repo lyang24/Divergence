@@ -177,6 +177,53 @@ impl IndexWriter {
         Ok(())
     }
 
+    /// Write v4 compressed adjacency layout.
+    ///
+    /// Same as write_v3 but uses delta-varint encoding for neighbor lists.
+    /// Records are 40-60% smaller → more records per 4KB page.
+    pub fn write_v4<'a>(
+        &self,
+        num_vectors: u32,
+        dimension: usize,
+        metric: &str,
+        max_degree: usize,
+        ef_construction: usize,
+        entry_set: &[u32],
+        vectors_data: &[f32],
+        neighbors_fn: impl Fn(u32) -> &'a [u32],
+        reorder: &[u32],
+        adj_reorder_label: &str,
+    ) -> io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+
+        let num_pages = adjacency::write_packed_adjacency_compressed(
+            &self.pages_path(),
+            &self.adj_index_path(),
+            num_vectors,
+            &neighbors_fn,
+            reorder,
+        )?;
+
+        vectors::write_vectors_file(&self.vec_path(), vectors_data)?;
+
+        let meta = IndexMeta {
+            dimension,
+            metric: metric.to_string(),
+            num_vectors,
+            max_degree,
+            ef_construction,
+            adj_block_size: BLOCK_SIZE,
+            entry_set: entry_set.iter().map(|&v| v).collect(),
+            adj_layout_version: 4,
+            pq: None,
+            num_pages: Some(num_pages),
+            adj_reorder: Some(adj_reorder_label.to_string()),
+        };
+        meta.write_to(&self.meta_path())?;
+
+        Ok(())
+    }
+
     pub fn adj_path(&self) -> PathBuf {
         self.dir.join("adjacency.dat")
     }

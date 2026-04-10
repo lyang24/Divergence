@@ -3012,7 +3012,7 @@ fn exp_sift_phase2_freeexp() {
                         disk_graph_search_pipe_v3_freeexp(
                             &bench_queries[qi], &entry_set, k, ef, prefetch_width, 0, 0,
                             &pool, &io, &fp32_bank, &adj_index, &page_to_vids,
-                            max_bonus, &mut perf, PerfLevel::EnableTime, sched_b,
+                            max_bonus, &mut perf, PerfLevel::EnableTime, sched_b, false,
                         ).await
                     } else {
                         disk_graph_search_pipe_v3_pagesched(
@@ -3111,7 +3111,7 @@ fn exp_sift_phase2_freeexp() {
                         disk_graph_search_pipe_v3_freeexp(
                             &bench_queries[qi], &entry_set, k, ef, prefetch_width, 0, 0,
                             &pool, &io, &fp32_bank, &adj_index, &page_to_vids,
-                            max_bonus, &mut perf, PerfLevel::EnableTime, sched_b,
+                            max_bonus, &mut perf, PerfLevel::EnableTime, sched_b, false,
                         ).await
                     } else {
                         disk_graph_search_pipe_v3_pagesched(
@@ -3283,7 +3283,7 @@ fn exp_cohere_phase2_freeexp() {
                         disk_graph_search_pipe_v3_freeexp(
                             &bench_queries[qi], &entry_set, k, ef, prefetch_width, 0, 0,
                             &pool, &io, &fp32_bank, &adj_index, &page_to_vids,
-                            max_bonus, &mut perf, PerfLevel::EnableTime, sched_b,
+                            max_bonus, &mut perf, PerfLevel::EnableTime, sched_b, false,
                         ).await
                     } else {
                         disk_graph_search_pipe_v3_pagesched(
@@ -3382,7 +3382,7 @@ fn exp_cohere_phase2_freeexp() {
                         disk_graph_search_pipe_v3_freeexp(
                             &bench_queries[qi], &entry_set, k, ef, prefetch_width, 0, 0,
                             &pool, &io, &fp32_bank, &adj_index, &page_to_vids,
-                            max_bonus, &mut perf, PerfLevel::EnableTime, sched_b,
+                            max_bonus, &mut perf, PerfLevel::EnableTime, sched_b, false,
                         ).await
                     } else {
                         disk_graph_search_pipe_v3_pagesched(
@@ -3519,7 +3519,7 @@ fn run_phase3_sweep(
                         disk_graph_search_pipe_v3_freeexp(
                             wq, entry_set, k, ef, 4, 0, 0,
                             &pool, &io, &warmup_bank, adj_index, page_to_vids,
-                            2000, &mut perf, PerfLevel::CountOnly, sched_b,
+                            2000, &mut perf, PerfLevel::CountOnly, sched_b, false,
                         ).await;
                     }
                 }
@@ -3563,7 +3563,7 @@ fn run_phase3_sweep(
                             let results = disk_graph_search_pipe_v3_freeexp(
                                 &q, &es_c, k, ef, per_query_w, 0, 0,
                                 &pool_c, &io_c, &bank, &adj_c, &p2v_c,
-                                2000, &mut perf, PerfLevel::EnableTime, sched_b,
+                                2000, &mut perf, PerfLevel::EnableTime, sched_b, false,
                             ).await;
                             let elapsed_ms = t.elapsed().as_secs_f64() * 1_000.0;
                             (results, perf, elapsed_ms)
@@ -3683,7 +3683,7 @@ fn run_phase3_sweep(
                             let results = disk_graph_search_pipe_v3_freeexp(
                                 &q, &es_c, k, ef, per_query_w, 0, 0,
                                 &pool_c, &io_c, &bank, &adj_c, &p2v_c,
-                                2000, &mut perf, PerfLevel::EnableTime, sched_b,
+                                2000, &mut perf, PerfLevel::EnableTime, sched_b, false,
                             ).await;
                             let elapsed_ms = t.elapsed().as_secs_f64() * 1_000.0;
                             (results, perf, elapsed_ms)
@@ -3860,4 +3860,246 @@ fn exp_multi_query_scheduler_cohere() {
         n, dim, k, &adj_index, &page_to_vids, &entry_set,
         num_pages, dir_str,
     );
+}
+
+// =============================================================================
+// Compressed Adjacency (v4): delta-varint experiment
+// =============================================================================
+
+/// Build v4 compressed adjacency layout for Cohere 100K.
+/// Reuses the NSW index from exp_veloann_phase1_build, just re-packs with v4.
+/// Env: COHERE_DIR, COHERE_N, BENCH_DIR (required).
+#[test]
+#[ignore]
+fn exp_compressed_adj_build() {
+    let max_n: usize = std::env::var("COHERE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000);
+
+    let dataset_dir = std::env::var("COHERE_DIR").unwrap_or_else(|_| {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        format!("{}/../../data/cohere_100k", manifest)
+    });
+
+    let (vectors, _queries_flat, _ground_truth, n, _nq, dim, _k) =
+        match load_dataset(&dataset_dir, max_n) {
+            Some(d) => d,
+            None => return,
+        };
+
+    let bench_dir = std::env::var("BENCH_DIR").expect("BENCH_DIR required");
+    let v4_dir = std::path::PathBuf::from(&bench_dir)
+        .join("veloann_phase1")
+        .join("heavy_edge_v4");
+
+    // Check if already built
+    if v4_dir.join("adj_index.dat").exists() && v4_dir.join("vectors.dat").exists() {
+        let meta = IndexMeta::load_from(&v4_dir.join("meta.json")).unwrap();
+        eprintln!("Already built: v4 {} pages, skipping", meta.num_pages.unwrap_or(0));
+        return;
+    }
+
+    // Build NSW index (same as phase1_build)
+    let m_max = 32;
+    let ef_construction = 200;
+    eprintln!("=== BUILD v4: Cohere {}K, dim={}, m_max={}, ef_c={} ===", n / 1000, dim, m_max, ef_construction);
+
+    eprintln!("Building NSW index ...");
+    let t0 = std::time::Instant::now();
+    let config = NswConfig::new(m_max, ef_construction);
+    let builder = NswBuilder::new(config, dim, MetricType::Cosine, n);
+    for (i, v) in vectors.chunks_exact(dim).enumerate() {
+        builder.insert(VectorId(i as u32), v);
+    }
+    let index = builder.build();
+    eprintln!("  Index built in {:.1}s", t0.elapsed().as_secs_f64());
+
+    let entry_ids: Vec<u32> = index.entry_set().iter().map(|v| v.0).collect();
+
+    // Compute heavy_edge reorder
+    eprintln!("Computing heavy_edge reorder ...");
+    let t0 = std::time::Instant::now();
+    let he_reorder = heavy_edge_reorder_graph(n, |vid| index.neighbors(vid));
+    eprintln!("  Reorder in {:.1}s", t0.elapsed().as_secs_f64());
+
+    // Write v3 (uncompressed) for comparison page count
+    let v3_dir = std::path::PathBuf::from(&bench_dir)
+        .join("veloann_phase1")
+        .join("heavy_edge");
+    if v3_dir.join("meta.json").exists() {
+        let v3_meta = IndexMeta::load_from(&v3_dir.join("meta.json")).unwrap();
+        eprintln!("  v3 reference: {} pages", v3_meta.num_pages.unwrap_or(0));
+    }
+
+    // Write v4 compressed
+    std::fs::create_dir_all(&v4_dir).unwrap();
+    let w = IndexWriter::new(&v4_dir);
+    w.write_v4(
+        n as u32, dim, "cosine", index.max_degree(), ef_construction,
+        &entry_ids, index.vectors_raw(), |vid| index.neighbors(vid),
+        &he_reorder, "heavy_edge",
+    ).unwrap();
+
+    // Copy vectors from v3 dir if available, otherwise write fresh
+    let v3_vecs = v3_dir.join("vectors.dat");
+    if v3_vecs.exists() {
+        std::fs::copy(&v3_vecs, v4_dir.join("vectors.dat")).unwrap();
+    }
+
+    let meta = IndexMeta::load_from(&v4_dir.join("meta.json")).unwrap();
+    eprintln!("  v4 compressed: {} pages — DONE", meta.num_pages.unwrap_or(0));
+}
+
+/// Benchmark compressed (v4) vs uncompressed (v3) adjacency on Cohere 100K.
+/// Env: COHERE_DIR, COHERE_N, BENCH_DIR (required).
+#[test]
+#[ignore]
+fn exp_compressed_adj_bench() {
+    let max_n: usize = std::env::var("COHERE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000);
+
+    let dataset_dir = std::env::var("COHERE_DIR").unwrap_or_else(|_| {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        format!("{}/../../data/cohere_100k", manifest)
+    });
+
+    let (_vectors, queries_flat, ground_truth, n, nq, dim, k) =
+        match load_dataset(&dataset_dir, max_n) {
+            Some(d) => d,
+            None => return,
+        };
+
+    let num_bench_queries = 200;
+    let num_warmup = 50;
+    let ef = 200;
+    let cache_pcts: &[usize] = &[1, 5, 20];
+
+    assert!(nq >= num_bench_queries + num_warmup);
+
+    let bench_dir = std::env::var("BENCH_DIR").expect("BENCH_DIR required");
+    let base_dir = std::path::PathBuf::from(&bench_dir).join("veloann_phase1");
+
+    let bench_queries: Vec<Vec<f32>> = queries_flat
+        .chunks_exact(dim).take(num_bench_queries).map(|c| c.to_vec()).collect();
+    let bench_gt: Vec<&Vec<u32>> = ground_truth.iter().take(num_bench_queries).collect();
+    let warmup_vecs: Vec<Vec<f32>> = queries_flat
+        .chunks_exact(dim).skip(num_bench_queries).take(num_warmup).map(|c| c.to_vec()).collect();
+
+    // Test both v3 and v4 layouts
+    let configs: &[(&str, &str, bool)] = &[
+        ("v3", "heavy_edge", false),
+        ("v4", "heavy_edge_v4", true),
+    ];
+
+    for &(label, subdir, compressed) in configs {
+        let layout_dir = base_dir.join(subdir);
+        if !layout_dir.join("adj_index.dat").exists() {
+            eprintln!("Skipping {}: not built (run exp_compressed_adj_build)", label);
+            continue;
+        }
+
+        let disk_vectors = load_vectors(&layout_dir.join("vectors.dat"), n, dim).unwrap();
+        let meta = IndexMeta::load_from(&layout_dir.join("meta.json")).unwrap();
+        let num_pages = meta.num_pages.unwrap_or(0) as usize;
+        let adj_index = load_adj_index(&layout_dir.join("adj_index.dat"), n).unwrap();
+        let entry_set: Vec<VectorId> = meta.entry_set.iter().map(|&v| VectorId(v)).collect();
+        let page_to_vids = build_page_to_vids(&adj_index, n);
+        let dir_str = layout_dir.to_str().unwrap();
+
+        eprintln!(
+            "\n=== {} (adj_v{}): Cohere {}K, dim={}, ef={}, {} pages ===",
+            label, if compressed { 4 } else { 3 }, n / 1000, dim, ef, num_pages
+        );
+
+        if !with_runtime(|rt| {
+            rt.block_on(async {
+                let fp32_bank = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::Cosine);
+
+                for &cpct in cache_pcts {
+                    let pool_pages = (num_pages * cpct / 100).max(16);
+
+                    // --- Warm mode ---
+                    eprintln!(
+                        "\n--- {} cache={}% ({}/{} pages) warm ---",
+                        label, cpct, pool_pages, num_pages
+                    );
+                    eprintln!(
+                        "{:>7} {:>7} {:>8} {:>8} {:>7} {:>7} {:>7} {:>8} {:>7}",
+                        "recall", "q_p50ms", "q_p99ms", "QPS",
+                        "exp/q", "blk/q", "mis/q", "bonus/q", "dist/q"
+                    );
+
+                    let io = std::rc::Rc::new(
+                        IoDriver::open_pages(dir_str, dim, 64, true)
+                            .await.expect("failed to open IO driver"),
+                    );
+                    let pool = std::rc::Rc::new(AdjacencyPool::new(pool_pages * 4096));
+                    let handle = AdjacencyPool::spawn_prefetch_worker(
+                        std::rc::Rc::clone(&pool), std::rc::Rc::clone(&io), 4,
+                    );
+
+                    // Warmup
+                    for wq in &warmup_vecs {
+                        let mut perf = SearchPerfContext::default();
+                        disk_graph_search_pipe_v3_freeexp(
+                            wq, &entry_set, k, ef, 4, 0, 0,
+                            &pool, &io, &fp32_bank, &adj_index, &page_to_vids,
+                            2000, &mut perf, PerfLevel::CountOnly, 4, compressed,
+                        ).await;
+                    }
+
+                    // Benchmark
+                    let mut query_latencies_ms: Vec<f64> = Vec::with_capacity(num_bench_queries);
+                    let mut recalls: Vec<f64> = Vec::with_capacity(num_bench_queries);
+                    let mut sum_exp = 0u64;
+                    let mut sum_blk = 0u64;
+                    let mut sum_miss = 0u64;
+                    let mut sum_bonus = 0u64;
+                    let mut sum_dist = 0u64;
+
+                    let wall_start = std::time::Instant::now();
+                    for qi in 0..num_bench_queries {
+                        let mut perf = SearchPerfContext::default();
+                        let t = std::time::Instant::now();
+                        let results = disk_graph_search_pipe_v3_freeexp(
+                            &bench_queries[qi], &entry_set, k, ef, 4, 0, 0,
+                            &pool, &io, &fp32_bank, &adj_index, &page_to_vids,
+                            2000, &mut perf, PerfLevel::EnableTime, 4, compressed,
+                        ).await;
+                        query_latencies_ms.push(t.elapsed().as_secs_f64() * 1_000.0);
+
+                        let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                        recalls.push(recall_at_k(&ids, bench_gt[qi]));
+                        sum_exp += perf.expansions;
+                        sum_blk += perf.blocks_read;
+                        sum_miss += perf.blocks_miss;
+                        sum_bonus += perf.bonus_scored;
+                        sum_dist += perf.distance_computes;
+                    }
+                    let wall_secs = wall_start.elapsed().as_secs_f64();
+                    let nq = num_bench_queries as f64;
+
+                    query_latencies_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let q_p50 = query_latencies_ms[(nq * 0.50) as usize];
+                    let q_p99 = query_latencies_ms[((nq * 0.99) as usize).min(num_bench_queries - 1)];
+
+                    eprintln!(
+                        "{:>7.3} {:>7.1} {:>8.1} {:>8.1} {:>7.1} {:>7.1} {:>7.1} {:>8.1} {:>7.1}",
+                        recalls.iter().sum::<f64>() / nq,
+                        q_p50, q_p99, nq / wall_secs,
+                        sum_exp as f64 / nq, sum_blk as f64 / nq, sum_miss as f64 / nq,
+                        sum_bonus as f64 / nq, sum_dist as f64 / nq,
+                    );
+
+                    pool.stop_prefetch();
+                    handle.await;
+                }
+            });
+        }) {
+            eprintln!("Skipped: io_uring not available");
+        }
+    }
 }

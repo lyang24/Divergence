@@ -10,8 +10,8 @@ pub use adjacency::{
     // v3: page-packed adjacency
     AdjIndexEntry, affinity_reorder_graph, bfs_reorder_graph, graphago_reorder_graph,
     heavy_edge_reorder_graph, load_adj_index, neighbor_run_reorder_graph,
-    packed_record_size, page_record_vid,
-    twpp_reorder_graph, write_packed_adjacency,
+    packed_record_size, page_record_vid, page_decode_neighbors_compressed,
+    twpp_reorder_graph, write_packed_adjacency, write_packed_adjacency_compressed,
 };
 pub use meta::IndexMeta;
 pub use vectors::{f16_to_f32, load_vectors, write_vectors_file, write_vectors_fp16_file, write_vectors_int8_file};
