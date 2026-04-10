@@ -11712,3 +11712,274 @@ fn exp_sift_phase2_freeexp() {
         eprintln!("Skipped: io_uring not available");
     }
 }
+
+// =============================================================================
+// Cohere 100K Phase 2: Free expansions cross-validation
+// =============================================================================
+
+/// Phase 2 free expansion sweep on Cohere 100K (dim=768, cosine).
+/// Uses pre-built artifacts from exp_veloann_phase1_build.
+/// Env: COHERE_DIR, COHERE_N, BENCH_DIR (required).
+#[test]
+#[ignore]
+fn exp_cohere_phase2_freeexp() {
+    let max_n: usize = std::env::var("COHERE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000);
+
+    let dataset_dir = std::env::var("COHERE_DIR").unwrap_or_else(|_| {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        format!("{}/../../data/cohere_100k", manifest)
+    });
+
+    let (_vectors, queries_flat, ground_truth, n, nq, dim, k) =
+        match load_cohere_dataset(&dataset_dir, max_n) {
+            Some(d) => d,
+            None => return,
+        };
+
+    let prefetch_width = 4;
+    let num_bench_queries = 100;
+    let cache_pct = 5usize;
+    let sched_b = 4usize;
+
+    assert!(nq >= num_bench_queries, "Need {} queries but dataset has {}", num_bench_queries, nq);
+
+    // Load pre-built artifacts
+    let bench_dir = std::env::var("BENCH_DIR").expect("BENCH_DIR required");
+    let layout_dir = std::path::PathBuf::from(&bench_dir)
+        .join("veloann_phase1")
+        .join("heavy_edge");
+
+    assert!(
+        layout_dir.join("adj_index.dat").exists(),
+        "Run exp_veloann_phase1_build first! Missing: {}/adj_index.dat",
+        layout_dir.display()
+    );
+
+    let disk_vectors = load_vectors(&layout_dir.join("vectors.dat"), n, dim).unwrap();
+    let meta = IndexMeta::load_from(&layout_dir.join("meta.json")).unwrap();
+    let num_pages = meta.num_pages.unwrap_or(0) as usize;
+    let adj_index = load_adj_index(&layout_dir.join("adj_index.dat"), n).unwrap();
+    let entry_set: Vec<VectorId> = meta.entry_set.iter().map(|&v| VectorId(v)).collect();
+
+    // Build page-to-VIDs inverted index
+    let page_to_vids = build_page_to_vids(&adj_index, n);
+
+    eprintln!(
+        "=== PHASE2-FREEEXP: Cohere {}K, dim={}, k={}, W={}, cache={}%, {} pages ===",
+        n / 1000, dim, k, prefetch_width, cache_pct, num_pages
+    );
+
+    let bench_queries: Vec<Vec<f32>> = queries_flat
+        .chunks_exact(dim).take(num_bench_queries).map(|c| c.to_vec()).collect();
+    let bench_gt: Vec<&Vec<u32>> = ground_truth.iter().take(num_bench_queries).collect();
+    let dir_str = layout_dir.to_str().unwrap().to_owned();
+
+    if !with_runtime(|rt| {
+        rt.block_on(async {
+            let fp32_bank = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::Cosine);
+
+            // --- Sweep 1: free expansion cap at ef=200 ---
+            eprintln!("\n--- Sweep 1: Free expansion cap sweep (ef=200, cold, sched_b={}) ---", sched_b);
+            eprintln!(
+                "{:>14} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>12} {:>12} {:>7}",
+                "config", "recall", "p50ms", "p99ms", "QPS",
+                "exp/q", "blk/q", "mis/q", "hit/q", "phy/q",
+                "bonus_sc/q", "bonus_pu/q", "dist/q"
+            );
+
+            let configs: &[(&str, bool, u64)] = &[
+                ("baseline",     false, 0),
+                ("freeexp_500",  true,  500),
+                ("freeexp_2000", true,  2000),
+                ("freeexp_inf",  true,  u64::MAX),
+            ];
+            let ef = 200;
+
+            for &(label, use_freeexp, max_bonus) in configs {
+                let io = Rc::new(
+                    IoDriver::open_pages(&dir_str, dim, 64, true)
+                        .await.expect("failed to open IO driver"),
+                );
+                let pool_pages = (num_pages * cache_pct / 100).max(256);
+                let pool = Rc::new(AdjacencyPool::new(pool_pages * 4096));
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_width,
+                );
+
+                let mut recalls = Vec::with_capacity(num_bench_queries);
+                let mut latencies_ms = Vec::with_capacity(num_bench_queries);
+                let mut sum_exp = 0u64;
+                let mut sum_blk = 0u64;
+                let mut sum_miss = 0u64;
+                let mut sum_hit = 0u64;
+                let mut sum_phys = 0u64;
+                let mut sum_bonus_sc = 0u64;
+                let mut sum_bonus_pu = 0u64;
+                let mut sum_dist = 0u64;
+
+                let wall_start = std::time::Instant::now();
+                for qi in 0..num_bench_queries {
+                    pool.pause_prefetch(true);
+                    pool.drain_prefetch();
+                    monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+                    while pool.has_loading() {
+                        monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+                    }
+                    pool.clear();
+                    pool.pause_prefetch(false);
+
+                    let mut perf = SearchPerfContext::default();
+                    let t0 = std::time::Instant::now();
+                    let results = if use_freeexp {
+                        disk_graph_search_pipe_v3_freeexp(
+                            &bench_queries[qi], &entry_set, k, ef, prefetch_width, 0, 0,
+                            &pool, &io, &fp32_bank, &adj_index, &page_to_vids,
+                            max_bonus, &mut perf, PerfLevel::EnableTime, sched_b,
+                        ).await
+                    } else {
+                        disk_graph_search_pipe_v3_pagesched(
+                            &bench_queries[qi], &entry_set, k, ef, prefetch_width, 0, 0,
+                            &pool, &io, &fp32_bank, &adj_index,
+                            &mut perf, PerfLevel::EnableTime, sched_b,
+                        ).await
+                    };
+                    latencies_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
+
+                    let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                    recalls.push(recall_at_k(&ids, bench_gt[qi]));
+
+                    sum_exp += perf.expansions;
+                    sum_blk += perf.blocks_read;
+                    sum_miss += perf.blocks_miss;
+                    sum_hit += perf.blocks_hit;
+                    sum_phys += perf.phys_reads;
+                    sum_bonus_sc += perf.bonus_scored;
+                    sum_bonus_pu += perf.bonus_pushed;
+                    sum_dist += perf.distance_computes;
+                }
+                let wall_secs = wall_start.elapsed().as_secs_f64();
+                let nq = num_bench_queries as f64;
+                let avg_recall: f64 = recalls.iter().sum::<f64>() / nq;
+                latencies_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let p50 = latencies_ms[(nq * 0.50) as usize];
+                let p99 = latencies_ms[((nq * 0.99) as usize).min(num_bench_queries - 1)];
+
+                eprintln!(
+                    "{:>14} {:>7.3} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>12.1} {:>12.1} {:>7.1}",
+                    label, avg_recall, p50, p99, nq / wall_secs,
+                    sum_exp as f64 / nq, sum_blk as f64 / nq, sum_miss as f64 / nq,
+                    sum_hit as f64 / nq, sum_phys as f64 / nq,
+                    sum_bonus_sc as f64 / nq, sum_bonus_pu as f64 / nq,
+                    sum_dist as f64 / nq,
+                );
+
+                pool.stop_prefetch();
+                handle.await;
+            }
+
+            // --- Sweep 2: ef reduction with free expansion ---
+            eprintln!("\n--- Sweep 2: ef reduction with freeexp_2000 (cold, sched_b={}) ---", sched_b);
+            eprintln!(
+                "{:>5} {:>10} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>12} {:>12} {:>7}",
+                "ef", "freeexp", "recall", "p50ms", "p99ms", "QPS",
+                "exp/q", "blk/q", "mis/q", "hit/q",
+                "bonus_sc/q", "bonus_pu/q", "dist/q"
+            );
+
+            let ef_configs: &[(usize, bool, u64)] = &[
+                (100, false, 0),
+                (100, true,  2000),
+                (150, false, 0),
+                (150, true,  2000),
+                (200, false, 0),
+                (200, true,  2000),
+            ];
+
+            for &(ef, use_freeexp, max_bonus) in ef_configs {
+                let io = Rc::new(
+                    IoDriver::open_pages(&dir_str, dim, 64, true)
+                        .await.expect("failed to open IO driver"),
+                );
+                let pool_pages = (num_pages * cache_pct / 100).max(256);
+                let pool = Rc::new(AdjacencyPool::new(pool_pages * 4096));
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_width,
+                );
+
+                let mut recalls = Vec::with_capacity(num_bench_queries);
+                let mut latencies_ms = Vec::with_capacity(num_bench_queries);
+                let mut sum_exp = 0u64;
+                let mut sum_blk = 0u64;
+                let mut sum_miss = 0u64;
+                let mut sum_hit = 0u64;
+                let mut sum_bonus_sc = 0u64;
+                let mut sum_bonus_pu = 0u64;
+                let mut sum_dist = 0u64;
+
+                let wall_start = std::time::Instant::now();
+                for qi in 0..num_bench_queries {
+                    pool.pause_prefetch(true);
+                    pool.drain_prefetch();
+                    monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+                    while pool.has_loading() {
+                        monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+                    }
+                    pool.clear();
+                    pool.pause_prefetch(false);
+
+                    let mut perf = SearchPerfContext::default();
+                    let t0 = std::time::Instant::now();
+                    let results = if use_freeexp {
+                        disk_graph_search_pipe_v3_freeexp(
+                            &bench_queries[qi], &entry_set, k, ef, prefetch_width, 0, 0,
+                            &pool, &io, &fp32_bank, &adj_index, &page_to_vids,
+                            max_bonus, &mut perf, PerfLevel::EnableTime, sched_b,
+                        ).await
+                    } else {
+                        disk_graph_search_pipe_v3_pagesched(
+                            &bench_queries[qi], &entry_set, k, ef, prefetch_width, 0, 0,
+                            &pool, &io, &fp32_bank, &adj_index,
+                            &mut perf, PerfLevel::EnableTime, sched_b,
+                        ).await
+                    };
+                    latencies_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
+
+                    let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                    recalls.push(recall_at_k(&ids, bench_gt[qi]));
+
+                    sum_exp += perf.expansions;
+                    sum_blk += perf.blocks_read;
+                    sum_miss += perf.blocks_miss;
+                    sum_hit += perf.blocks_hit;
+                    sum_bonus_sc += perf.bonus_scored;
+                    sum_bonus_pu += perf.bonus_pushed;
+                    sum_dist += perf.distance_computes;
+                }
+                let wall_secs = wall_start.elapsed().as_secs_f64();
+                let nq = num_bench_queries as f64;
+                let avg_recall: f64 = recalls.iter().sum::<f64>() / nq;
+                latencies_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let p50 = latencies_ms[(nq * 0.50) as usize];
+                let p99 = latencies_ms[((nq * 0.99) as usize).min(num_bench_queries - 1)];
+
+                eprintln!(
+                    "{:>5} {:>10} {:>7.3} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>12.1} {:>12.1} {:>7.1}",
+                    ef, if use_freeexp { "ON" } else { "OFF" },
+                    avg_recall, p50, p99, nq / wall_secs,
+                    sum_exp as f64 / nq, sum_blk as f64 / nq, sum_miss as f64 / nq,
+                    sum_hit as f64 / nq,
+                    sum_bonus_sc as f64 / nq, sum_bonus_pu as f64 / nq,
+                    sum_dist as f64 / nq,
+                );
+
+                pool.stop_prefetch();
+                handle.await;
+            }
+        });
+    }) {
+        eprintln!("Skipped: io_uring not available");
+    }
+}
