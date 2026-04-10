@@ -23,7 +23,7 @@ pub use perf::{
 };
 pub use runtime::{spawn_worker, WorkerConfig};
 pub use search::{
-    build_page_to_vids,
+    build_page_to_vids, execute_query_batch, recommend_batch_size,
     disk_graph_search, disk_graph_search_exp, disk_graph_search_pipe, disk_graph_search_pipe_v3,
     disk_graph_search_pipe_v3_cacheaware, disk_graph_search_pipe_v3_freeexp,
     disk_graph_search_pipe_v3_refine, disk_graph_search_pipe_v3_refine_3stage,

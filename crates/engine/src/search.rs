@@ -6,6 +6,7 @@
 //! the NVMe read is in flight.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Instant;
 
 use divergence_core::distance::VectorBank;
@@ -1806,4 +1807,94 @@ pub async fn disk_graph_search_pipe_v3_refine_3stage(
     fp32_refined.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
     fp32_refined.truncate(k);
     fp32_refined
+}
+
+// ---------------------------------------------------------------------------
+// Multi-query coroutine batch execution
+// ---------------------------------------------------------------------------
+
+/// Recommend the number of concurrent queries per core (B) for coroutine scheduling.
+///
+/// Uses VeloANN formula: B = ceil(alpha * I / T) where
+///   alpha = cache miss rate (misses per expansion, typically 0.01-0.05)
+///   I     = NVMe IO latency in microseconds (typically ~4 for modern NVMe)
+///   T     = compute time per expansion in microseconds (~dim * 0.005)
+///
+/// Result is clamped to [1, max_b].
+pub fn recommend_batch_size(
+    dim: usize,
+    cache_miss_rate: f64,
+    io_latency_us: f64,
+    max_b: usize,
+) -> usize {
+    let t_compute_us = dim as f64 * 0.005;
+    let b = (cache_miss_rate * io_latency_us / t_compute_us).ceil() as usize;
+    b.clamp(1, max_b)
+}
+
+/// Execute a batch of B queries concurrently on a single monoio core.
+///
+/// Each query is spawned as a coroutine via `monoio::spawn`. Queries share the
+/// cache (`pool`), IO driver (`io`), and vector bank (`bank`) via Rc. When one
+/// query hits a cache miss and yields at `.await`, another query runs — hiding
+/// IO latency behind useful compute.
+///
+/// `total_prefetch_budget` is split across queries: each gets `max(1, budget/B)`.
+/// `perf_out` must have length >= `queries.len()`.
+pub async fn execute_query_batch(
+    queries: &[&[f32]],
+    entry_set: &Rc<[VectorId]>,
+    k: usize,
+    ef: usize,
+    total_prefetch_budget: usize,
+    stall_limit: u32,
+    drain_budget: u32,
+    pool: &Rc<AdjacencyPool>,
+    io: &Rc<IoDriver>,
+    bank: &Rc<dyn VectorBank>,
+    adj_index: &Rc<[AdjIndexEntry]>,
+    page_to_vids: &Rc<[Vec<u32>]>,
+    max_bonus: u64,
+    perf_out: &mut [SearchPerfContext],
+    level: PerfLevel,
+    page_sched_b: usize,
+) -> Vec<Vec<ScoredId>> {
+    let b = queries.len();
+    if b == 0 {
+        return Vec::new();
+    }
+
+    let per_query_w = (total_prefetch_budget / b).max(1);
+
+    let mut handles = Vec::with_capacity(b);
+    for i in 0..b {
+        let q: Rc<[f32]> = Rc::from(queries[i]);
+        let pool_c = Rc::clone(pool);
+        let io_c = Rc::clone(io);
+        let bank_c = Rc::clone(bank);
+        let adj_c = Rc::clone(adj_index);
+        let p2v_c = Rc::clone(page_to_vids);
+        let entry_c = Rc::clone(entry_set);
+
+        let handle = monoio::spawn(async move {
+            let mut perf = SearchPerfContext::default();
+            let results = disk_graph_search_pipe_v3_freeexp(
+                &q, &entry_c, k, ef, per_query_w, stall_limit, drain_budget,
+                &pool_c, &io_c, bank_c.as_ref(), &adj_c, &p2v_c,
+                max_bonus, &mut perf, level, page_sched_b,
+            ).await;
+            (results, perf)
+        });
+        handles.push(handle);
+    }
+
+    let mut all_results = Vec::with_capacity(b);
+    for (i, h) in handles.into_iter().enumerate() {
+        let (results, perf) = h.await;
+        all_results.push(results);
+        if i < perf_out.len() {
+            perf_out[i] = perf;
+        }
+    }
+    all_results
 }

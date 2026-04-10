@@ -3457,18 +3457,18 @@ fn run_phase3_sweep(
     entry_set: &[VectorId],
     num_pages: usize,
     dir_str: &str,
-    cache_pct: usize,
 ) {
     let num_bench_queries = bench_queries.len();
     let num_warmup = warmup_queries.len();
     let ef = 200;
     let sched_b = 4usize;
     let b_values: &[usize] = &[1, 2, 4, 8];
+    let cache_pcts: &[usize] = &[1, 5, 20];
     let total_prefetch_budget = 4usize;
 
     eprintln!(
-        "=== PHASE3: Multi-Query Scheduler, {} {}K, dim={}, ef={}, cache={}%, {} pages ===",
-        dataset_name, n / 1000, dim, ef, cache_pct, num_pages
+        "=== PHASE3: Multi-Query Scheduler, {} {}K, dim={}, ef={}, {} pages ===",
+        dataset_name, n / 1000, dim, ef, num_pages
     );
 
     if !with_runtime(|rt| {
@@ -3486,8 +3486,13 @@ fn run_phase3_sweep(
                 None
             };
 
-            // --- Warm mode ---
-            eprintln!("\n--- Warm mode (warmup {} queries, then benchmark) ---", num_warmup);
+            for &cpct in cache_pcts {
+            // Strict percentage — no .max(256) floor that inflates small datasets
+            let pool_pages = (num_pages * cpct / 100).max(16);  // min 16 pages (64KB)
+            eprintln!(
+                "\n--- cache={}% ({}/{} pages) warm (warmup {} queries) ---",
+                cpct, pool_pages, num_pages, num_warmup
+            );
             eprintln!(
                 "{:>2} {:>4} {:>7} {:>8} {:>8} {:>10} {:>10} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8} {:>7}",
                 "B", "W/q", "recall", "q_p50ms", "q_p99ms", "bat_p50ms", "bat_p99ms",
@@ -3496,7 +3501,6 @@ fn run_phase3_sweep(
 
             for &b in b_values {
                 let per_query_w = (total_prefetch_budget / b).max(1);
-                let pool_pages = (num_pages * cache_pct / 100).max(256);
 
                 let io = Rc::new(
                     IoDriver::open_pages(dir_str, dim, 64, true)
@@ -3609,7 +3613,10 @@ fn run_phase3_sweep(
             }
 
             // --- Cold mode (clear cache per batch) ---
-            eprintln!("\n--- Cold mode (clear cache before each batch) ---");
+            eprintln!(
+                "\n--- cache={}% ({}/{} pages) cold (clear cache before each batch) ---",
+                cpct, pool_pages, num_pages
+            );
             eprintln!(
                 "{:>2} {:>4} {:>7} {:>8} {:>8} {:>10} {:>10} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8} {:>7}",
                 "B", "W/q", "recall", "q_p50ms", "q_p99ms", "bat_p50ms", "bat_p99ms",
@@ -3618,7 +3625,6 @@ fn run_phase3_sweep(
 
             for &b in b_values {
                 let per_query_w = (total_prefetch_budget / b).max(1);
-                let pool_pages = (num_pages * cache_pct / 100).max(256);
 
                 let io = Rc::new(
                     IoDriver::open_pages(dir_str, dim, 64, true)
@@ -3725,6 +3731,7 @@ fn run_phase3_sweep(
                 pool.stop_prefetch();
                 handle.await;
             }
+            } // for &cpct in cache_pcts
         });
     }) {
         eprintln!("Skipped: io_uring not available");
@@ -3755,7 +3762,6 @@ fn exp_multi_query_scheduler_sift() {
 
     let num_bench_queries = 200;
     let num_warmup = 50;
-    let cache_pct = 5usize;
 
     assert!(nq >= num_bench_queries + num_warmup,
         "Need {} queries but dataset has {}", num_bench_queries + num_warmup, nq);
@@ -3790,7 +3796,7 @@ fn exp_multi_query_scheduler_sift() {
         "SIFT", MetricType::L2, &disk_vectors,
         &bench_queries, &bench_gt, &warmup_vecs,
         n, dim, k, &adj_index, &page_to_vids, &entry_set,
-        num_pages, dir_str, cache_pct,
+        num_pages, dir_str,
     );
 }
 
@@ -3818,7 +3824,6 @@ fn exp_multi_query_scheduler_cohere() {
 
     let num_bench_queries = 100;
     let num_warmup = 50;
-    let cache_pct = 5usize;
 
     assert!(nq >= num_bench_queries + num_warmup,
         "Need {} queries but dataset has {}", num_bench_queries + num_warmup, nq);
@@ -3853,6 +3858,6 @@ fn exp_multi_query_scheduler_cohere() {
         "Cohere", MetricType::Cosine, &disk_vectors,
         &bench_queries, &bench_gt, &warmup_vecs,
         n, dim, k, &adj_index, &page_to_vids, &entry_set,
-        num_pages, dir_str, cache_pct,
+        num_pages, dir_str,
     );
 }
