@@ -20,11 +20,9 @@ Key differences from failed EXP-BW (2026-03-03):
 
 ## Implementation
 
-No new library code — purely a test/experiment using existing primitives:
-- `monoio::spawn` for concurrent coroutines on single core
-- `Rc<AdjacencyPool>` shared across all B queries (cache sharing)
-- `Rc<IoDriver>` shared IO channel
-- Batched execution: process all queries in batches of B
+No new search library code. Test uses existing monoio::spawn + shared Rc primitives.
+Added `FP32SimdVectorBank::compute_norms` and `with_norms` to avoid per-spawn norm
+recomputation (cosine norm precompute is O(N×dim), ~87ms for 100K×768).
 
 ## Results — SIFT 1M (dim=128, L2)
 
@@ -32,19 +30,19 @@ No new library code — purely a test/experiment using existing primitives:
 
 | B | W/q | Recall | q_p50ms | q_p99ms | bat_p50ms | bat_p99ms | QPS | mis/q | hit/q | bonus/q |
 |---|-----|--------|---------|---------|-----------|-----------|-----|-------|-------|---------|
-| 1 | 4 | 0.963 | 6.9 | 9.6 | 6.9 | 9.6 | 144.4 | 1.1 | 202.7 | 52.2 |
-| 2 | 2 | 0.963 | 10.3 | 12.6 | 10.9 | 13.1 | **185.3** | 2.2 | 389.2 | 55.9 |
-| 4 | 1 | 0.963 | 21.1 | 28.0 | 25.1 | 28.5 | 161.2 | 5.2 | 763.8 | 64.8 |
-| 8 | 1 | 0.963 | 43.9 | 55.5 | 53.1 | 58.1 | 154.6 | 11.0 | 1513.1 | 72.9 |
+| 1 | 4 | 0.963 | 7.1 | 10.2 | 7.1 | 10.3 | 141.5 | 1.2 | 202.6 | 56.0 |
+| 2 | 2 | 0.963 | 10.4 | 14.1 | 10.9 | 14.5 | **183.6** | 2.2 | 389.4 | 57.0 |
+| 4 | 1 | 0.963 | 18.2 | 23.3 | 19.7 | 24.6 | **203.1** | 5.2 | 764.5 | 68.6 |
+| 8 | 1 | 0.963 | 45.2 | 54.5 | 54.2 | 58.1 | 150.5 | 10.5 | 1521.9 | 67.0 |
 
 ### Cold mode (clear cache before each batch)
 
 | B | W/q | Recall | q_p50ms | q_p99ms | bat_p50ms | bat_p99ms | QPS | mis/q | hit/q | bonus/q |
 |---|-----|--------|---------|---------|-----------|-----------|-----|-------|-------|---------|
-| 1 | 4 | 0.963 | 7.0 | 9.2 | 7.0 | 9.2 | 123.9 | 1.9 | 201.6 | 80.1 |
-| 2 | 2 | 0.963 | 10.2 | 12.9 | 10.9 | 13.1 | **169.9** | 3.1 | 387.5 | 77.5 |
-| 4 | 1 | 0.963 | 20.5 | 27.1 | 24.6 | 28.2 | 157.9 | 5.9 | 759.4 | 79.1 |
-| 8 | 1 | 0.963 | 40.0 | 50.8 | 48.7 | 55.1 | 161.6 | 11.4 | 1497.9 | 77.6 |
+| 1 | 4 | 0.963 | 7.1 | 10.6 | 7.1 | 10.6 | 122.2 | 1.9 | 201.6 | 80.1 |
+| 2 | 2 | 0.963 | 10.3 | 13.2 | 11.0 | 13.6 | **167.5** | 3.1 | 387.6 | 77.5 |
+| 4 | 1 | 0.963 | 17.1 | 22.0 | 18.5 | 22.8 | **203.1** | 6.0 | 758.3 | 79.3 |
+| 8 | 1 | 0.963 | 41.8 | 54.4 | 50.5 | 55.0 | 157.0 | 11.4 | 1503.8 | 76.4 |
 
 ## Results — Cohere 100K (dim=768, cosine)
 
@@ -52,80 +50,83 @@ No new library code — purely a test/experiment using existing primitives:
 
 | B | W/q | Recall | q_p50ms | q_p99ms | bat_p50ms | bat_p99ms | QPS | mis/q | hit/q | bonus/q |
 |---|-----|--------|---------|---------|-----------|-----------|-----|-------|-------|---------|
-| 1 | 4 | 0.963 | 6.9 | 8.6 | 94.1 | 95.8 | 10.6 | 0.3 | 201.0 | 12.0 |
-| 2 | 2 | 0.962 | 95.2 | 99.3 | 185.2 | 186.7 | 10.8 | 0.7 | 388.5 | 14.7 |
-| 4 | 1 | 0.962 | 187.4 | 282.5 | 367.2 | 370.0 | 10.9 | 2.1 | 761.3 | 22.1 |
-| 8 | 1 | 0.962 | 300.2 | 651.4 | 735.9 | 744.8 | 10.9 | 5.6 | 1473.5 | 30.8 |
+| 1 | 4 | 0.963 | 6.4 | 8.0 | 6.4 | 8.1 | 154.9 | 0.3 | 200.9 | 13.8 |
+| 2 | 2 | 0.963 | 10.1 | 11.7 | 10.6 | 11.8 | **191.4** | 0.7 | 388.8 | 11.9 |
+| 4 | 1 | 0.962 | 17.8 | 21.1 | 19.1 | 21.2 | **209.6** | 1.8 | 762.4 | 17.1 |
+| 8 | 1 | 0.962 | 37.0 | 44.2 | 40.6 | 45.3 | 193.8 | 5.3 | 1476.6 | 25.4 |
 
 ### Cold mode
 
 | B | W/q | Recall | q_p50ms | q_p99ms | bat_p50ms | bat_p99ms | QPS | mis/q | hit/q | bonus/q |
 |---|-----|--------|---------|---------|-----------|-----------|-----|-------|-------|---------|
-| 1 | 4 | 0.962 | 7.3 | 9.3 | 94.3 | 96.5 | 10.5 | 1.3 | 199.6 | 45.0 |
-| 2 | 2 | 0.962 | 95.7 | 99.4 | 185.8 | 187.3 | 10.7 | 1.9 | 387.1 | 41.5 |
-| 4 | 1 | 0.962 | 190.0 | 282.8 | 368.9 | 370.4 | 10.8 | 3.4 | 760.7 | 40.9 |
-| 8 | 1 | 0.963 | 300.5 | 652.0 | 735.7 | 739.0 | 10.8 | 6.7 | 1482.1 | 40.7 |
+| 1 | 4 | 0.962 | 7.1 | 9.1 | 7.2 | 9.1 | 120.7 | 1.3 | 199.6 | 45.0 |
+| 2 | 2 | 0.962 | 10.7 | 13.9 | 11.2 | 14.1 | **163.3** | 1.9 | 387.8 | 41.4 |
+| 4 | 1 | 0.963 | 18.0 | 21.1 | 18.9 | 21.2 | **198.7** | 3.3 | 763.3 | 40.5 |
+| 8 | 1 | 0.962 | 36.6 | 41.6 | 39.4 | 41.9 | 197.6 | 6.7 | 1479.7 | 39.9 |
 
 ## Analysis
 
-### SIFT 1M: B=2 is the sweet spot (+28% QPS)
+### Both datasets show B=4 as the optimal throughput point
 
-1. **B=2 warm: 185 QPS (+28% over B=1's 144)** — the best configuration. Two queries
-   interleave well: when one waits on IO, the other computes. Per-query p50 increases
-   from 6.9ms to 10.3ms (1.5x) but throughput scales 1.28x.
+| Dataset | B=1 QPS | B=2 QPS | B=4 QPS | B=8 QPS | Best speedup |
+|---------|---------|---------|---------|---------|-------------|
+| SIFT warm | 141.5 | 183.6 | **203.1** | 150.5 | **+44%** (B=4) |
+| SIFT cold | 122.2 | 167.5 | **203.1** | 157.0 | **+66%** (B=4) |
+| Cohere warm | 154.9 | 191.4 | **209.6** | 193.8 | **+35%** (B=4) |
+| Cohere cold | 120.7 | 163.3 | **198.7** | 197.6 | **+65%** (B=4) |
 
-2. **B=4 regresses**: 161 QPS, down from B=2's 185. Too many queries competing for
-   cache → misses increase from 1.1 to 5.2/q. Reduced prefetch (W=1) also hurts.
+### Key findings
 
-3. **B=8 further regresses**: 155 QPS. 11 misses/q, p99 at 55ms. Cache thrashing.
+1. **B=4 is the sweet spot on both datasets.** +44% QPS on SIFT warm, +35% on Cohere
+   warm. Cold mode gains are even larger (+65-66%) because more cache misses create more
+   yield points for interleaving.
 
-4. **p99 controlled at B=2**: 12.6ms warm (1.3x baseline's 9.6ms). Below the 3x
-   threshold for acceptable tail latency. B=4 reaches 28ms (2.9x), borderline.
+2. **B=8 regresses.** Cache thrashing (10-11 misses/q vs 1-5 at B=4) and reduced
+   prefetch budget cause p99 explosion and QPS drop.
 
-5. **Cold mode**: B=2 still best at 170 QPS (+37% over B=1's 124). More misses create
-   more yield points, so interleaving is slightly more effective. But B=4 and B=8
-   don't benefit further — cache thrashing dominates.
+3. **Recall unchanged** at 0.962-0.963 across all B values. Queries are independent —
+   interleaving doesn't affect search quality.
 
-6. **Recall unchanged** across all B values (0.963). Queries are independent.
+4. **Per-query p50 scales ~linearly**: B=1: 7ms, B=2: 10ms, B=4: 18ms, B=8: 37-45ms.
+   This is expected — queries share the core, so individual latency increases
+   proportionally to B.
 
-### Cohere 100K: No benefit from multi-query
+5. **Batch p99 controlled at B=4**: ~22-25ms (SIFT), ~21ms (Cohere). B=8 reaches
+   55ms (SIFT), 45ms (Cohere).
 
-1. **QPS flat at ~10.8** regardless of B. Per-query latency scales linearly (6.9ms →
-   95ms → 187ms → 300ms at B=1/2/4/8) with zero throughput gain.
+6. **Cache sharing amplifies with B**: hit/q at B=4 is ~760 (vs ~201 at B=1).
+   4 concurrent queries generate cache hits for each other via the shared
+   AdjacencyPool. This is the "co-resident benefit multiplied by B."
 
-2. **Root cause: compute-bound, not IO-bound.** At dim=768, distance computation takes
-   ~6.5ms per query (3260 distances × ~2µs each). With only 0.3 cache misses per query
-   (warm), there are almost no `.await` yield points. Queries run back-to-back with no
-   interleaving opportunity.
+7. **Cohere benefits despite being compute-heavy**: Unlike the failed previous run
+   (which had per-spawn norm recomputation overhead), with precomputed norms Cohere
+   shows similar scaling to SIFT. The 768-dim distance computation is ~6ms per query
+   but still leaves enough IO-idle time at yield points for interleaving.
 
-3. **Contrast with SIFT**: At dim=128, distance computation is ~0.5ms per query,
-   leaving ~6ms of IO-idle time for other queries to fill. Cohere fills the CPU with
-   compute, so there's no idle time to reclaim.
+### Why B=4 works now (vs EXP-BW failure at B=2)
 
-4. **The VeloANN formula predicts this**: B = ceil(α × I/T). For Cohere warm,
-   I ≈ 0.1ms (0.3 misses × 0.3ms each), T ≈ 6.5ms, so B = ceil(0.015) = 1.
-   Multi-query only helps when I/T >> 0.
+The old EXP-BW experiment (2026-03-03) saw p99 explode to 644ms at B=8 with zero QPS
+gain. The difference:
 
-### Cross-dataset comparison
-
-| Dataset | Dim | B=1 QPS | Best B | Best QPS | Speedup | IO idle time |
-|---------|-----|---------|--------|----------|---------|-------------|
-| SIFT 1M | 128 | 144 | B=2 | 185 | +28% | High (~80%) |
-| Cohere 100K | 768 | 10.6 | B=1 | 10.6 | 0% | Near zero |
+| Factor | EXP-BW (old) | Phase 3 (now) |
+|--------|-------------|---------------|
+| Layout | V1 (1 block/VID) | V3 pages + heavy_edge |
+| Cache hit rate | ~0% | 90%+ |
+| Misses/q at B=1 | ~200 | 1-2 |
+| Prefetch | B×W contention | Fixed W=4 budget |
+| Pivoting | None | sched_b=4 |
+| Free expansion | None | bonus from co-located VIDs |
 
 ## Conclusion
 
-Multi-query coroutine scheduling delivers **+28% QPS on SIFT 1M at B=2** with
-controlled tail latency (p99 < 1.5x baseline). This validates the VeloANN hypothesis
-that cooperative IO multiplexing fills CPU idle time during NVMe waits.
+Multi-query coroutine scheduling delivers **+35-66% single-core QPS at B=4** across
+both datasets with controlled tail latency. This validates the VeloANN cooperative
+IO multiplexing hypothesis. The technique works because:
 
-However, the benefit is **dimension-dependent**: high-dimensional data (Cohere, dim=768)
-is compute-bound, not IO-bound, leaving no idle time for interleaving. The technique
-works best when:
-- Dimensions are moderate (≤256) so distance computation is cheap
-- Cache miss rate is non-trivial (more yield points)
-- B is kept low (2-4) to avoid cache thrashing
+1. V3 page layout + heavy_edge keeps cache hit rate high even at B=4
+2. Shared AdjacencyPool means queries warm the cache for each other
+3. Fixed prefetch budget (W=4 total) prevents IO contention
+4. Cache-aware pivoting ensures queries expand cached candidates first
 
-The p99 explosion at B≥4 (even on SIFT) suggests that B=2 is the production operating
-point for single-core scheduling. Multi-core parallelism (separate cores, each with
-B=2) is the path to higher aggregate throughput.
+Production recommendation: **B=4 per core**, with multi-core parallelism via separate
+monoio runtimes per core (each with B=4), for aggregate throughput scaling.

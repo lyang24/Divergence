@@ -3479,6 +3479,13 @@ fn run_phase3_sweep(
             let adj_index_rc: Rc<[AdjIndexEntry]> = Rc::from(adj_index);
             let page_to_vids_rc: Rc<[Vec<u32>]> = Rc::from(page_to_vids);
 
+            // Precompute norms once (expensive for cosine — 87ms at 100K×768d)
+            let precomputed_norms: Option<Rc<[f32]>> = if metric == MetricType::Cosine {
+                Some(Rc::from(FP32SimdVectorBank::compute_norms(&vecs_rc, dim)))
+            } else {
+                None
+            };
+
             // --- Warm mode ---
             eprintln!("\n--- Warm mode (warmup {} queries, then benchmark) ---", num_warmup);
             eprintln!(
@@ -3539,10 +3546,14 @@ fn run_phase3_sweep(
                         let es_c = Rc::clone(&entry_set_rc);
                         let adj_c = Rc::clone(&adj_index_rc);
                         let p2v_c = Rc::clone(&page_to_vids_rc);
+                        let norms_c = precomputed_norms.clone();
                         let q = bench_queries[qi].clone();
 
                         handles.push(monoio::spawn(async move {
-                            let bank = FP32SimdVectorBank::new(&vecs_c, dim, metric);
+                            let bank = match norms_c {
+                                Some(n) => FP32SimdVectorBank::with_norms(&vecs_c, dim, metric, n.to_vec()),
+                                None => FP32SimdVectorBank::new(&vecs_c, dim, metric),
+                            };
                             let mut perf = SearchPerfContext::default();
                             let t = std::time::Instant::now();
                             let results = disk_graph_search_pipe_v3_freeexp(
@@ -3653,10 +3664,14 @@ fn run_phase3_sweep(
                         let es_c = Rc::clone(&entry_set_rc);
                         let adj_c = Rc::clone(&adj_index_rc);
                         let p2v_c = Rc::clone(&page_to_vids_rc);
+                        let norms_c = precomputed_norms.clone();
                         let q = bench_queries[qi].clone();
 
                         handles.push(monoio::spawn(async move {
-                            let bank = FP32SimdVectorBank::new(&vecs_c, dim, metric);
+                            let bank = match norms_c {
+                                Some(n) => FP32SimdVectorBank::with_norms(&vecs_c, dim, metric, n.to_vec()),
+                                None => FP32SimdVectorBank::new(&vecs_c, dim, metric),
+                            };
                             let mut perf = SearchPerfContext::default();
                             let t = std::time::Instant::now();
                             let results = disk_graph_search_pipe_v3_freeexp(

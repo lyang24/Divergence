@@ -297,19 +297,29 @@ pub struct FP32SimdVectorBank<'a> {
 impl<'a> FP32SimdVectorBank<'a> {
     pub fn new(vectors: &'a [f32], dim: usize, metric: MetricType) -> Self {
         let norms = if metric == MetricType::Cosine {
-            let n = vectors.len() / dim;
-            let mut norms = Vec::with_capacity(n);
-            for i in 0..n {
-                let offset = i * dim;
-                let v = &vectors[offset..offset + dim];
-                let norm_sq: f32 = v.iter().map(|x| x * x).sum();
-                norms.push(norm_sq);
-            }
-            Some(norms)
+            Some(Self::compute_norms(vectors, dim))
         } else {
             None
         };
         Self { vectors, dim, metric, norms }
+    }
+
+    /// Create a bank with precomputed norms (avoids recomputing per query).
+    pub fn with_norms(vectors: &'a [f32], dim: usize, metric: MetricType, norms: Vec<f32>) -> Self {
+        Self { vectors, dim, metric, norms: Some(norms) }
+    }
+
+    /// Precompute ||v_i||^2 for all vectors (for cosine metric).
+    pub fn compute_norms(vectors: &[f32], dim: usize) -> Vec<f32> {
+        let n = vectors.len() / dim;
+        let mut norms = Vec::with_capacity(n);
+        for i in 0..n {
+            let offset = i * dim;
+            let v = &vectors[offset..offset + dim];
+            let norm_sq: f32 = v.iter().map(|x| x * x).sum();
+            norms.push(norm_sq);
+        }
+        norms
     }
 }
 
